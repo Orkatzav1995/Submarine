@@ -17,7 +17,8 @@
  *   - Report IR_DETECTED as soon as any pulse activity is seen, and
  *     IR_NOT_DETECTED only after IR_ACTIVITY_TIMEOUT_MS of no activity.
  *   - Call Event_OnObjectDetection() only when the reported state
- *     actually changes.
+ *     actually changes, and enqueue the frame it returns at event
+ *     priority (tx_queue.h's TxQueue_EnqueueEvent(), Sec 7).
  *
  * Why polling instead of a driver/EXTI rewrite (PROJECT_GUIDE.md Open
  * Question #12): the IR sensor is known to produce a pulse train (not a
@@ -37,8 +38,8 @@
  *   - Touch the LED or buzzer - that is entirely Event's job.
  *   - Write to the SD card - Event's own Event_OnObjectDetection()
  *     already writes the events file.
- *   - Send anything over UART/TLV - same deferred boundary as every
- *     other Application module right now.
+ *   - Call Transport_UART_Send() itself - CommTxTask (main.c) is the
+ *     only task that ever does now; this file only enqueues.
  *   - Run its own FreeRTOS task by itself - it IS what
  *     ObjectDetectionTask (Sec 7) calls once per poll, not a separate
  *     concept from it.

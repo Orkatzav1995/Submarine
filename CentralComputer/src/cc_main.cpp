@@ -105,6 +105,8 @@ void printMenu()
     std::printf("[2] Request a measurement backfill (last hour)\n");
     std::printf("[3] Show status\n");
     std::printf("[4] Show a report (last 7 days)\n");
+    std::printf("[5] Send test command: set temperature Normal range (HW-B-C-02)\n");
+    std::printf("[6] Request the LNC's system time (HW-B-C-03)\n");
     std::printf("[q] Quit\n");
     std::printf("> ");
     std::fflush(stdout);
@@ -176,6 +178,34 @@ void handleRequestBackfill(data_collection::DataCollection &collection)
     std::printf("      CC builds and sends the request correctly.\n");
 }
 
+/* [5]: exercises B's "set limit" dispatch path (HW-B-C-02). The CC has
+   8 of these commands; this sends just one (temperature Normal range)
+   as a representative test, using a value deliberately different from
+   Configuration's default (15.0/30.0) so the change is unambiguous. */
+void handleSetTempNormalRange(management_command::ManagementCommand &mgmt)
+{
+    constexpr float kTestLow = 18.0f;
+    constexpr float kTestHigh = 28.0f;
+    bool sent = mgmt.setTempNormalRange(kTestLow, kTestHigh);
+    std::printf("\n[cmd] setTempNormalRange(%.1f, %.1f) -> sendFrame result: %s\n", kTestLow, kTestHigh,
+                sent ? "ok" : "FAILED (is the port open?)");
+    std::printf("      Check the STM32 debugger: g_dispatch_set_limit_count should increase by 1, and\n");
+    std::printf("      g_config_temp_normal_low/g_config_temp_normal_high should become %.1f/%.1f.\n", kTestLow,
+                kTestHigh);
+}
+
+/* [6]: exercises B's GET_SYSTEM_TIME_REQUEST/RESPONSE round trip
+   (HW-B-C-03). The reply arrives asynchronously via
+   Communication::callbacks.onSystemTimeResponse, registered in main()
+   below - it prints itself when it arrives, not here. */
+void handleRequestSystemTime(management_command::ManagementCommand &mgmt)
+{
+    bool sent = mgmt.requestSystemTime();
+    std::printf("\n[cmd] requestSystemTime() -> sendFrame result: %s\n", sent ? "ok" : "FAILED (is the port open?)");
+    std::printf("      Check the STM32 debugger's g_dispatch_system_time_request_count (should increase by 1).\n");
+    std::printf("      Waiting for the reply - it prints automatically when it arrives.\n");
+}
+
 }  // namespace
 
 int main()
@@ -195,6 +225,12 @@ int main()
     data_collection::DataCollection collection(comm, store);
     collection.onMeasurementBackfillComplete = []() { std::printf("\n[backfill] measurement backfill complete\n"); };
     collection.onEventBackfillComplete = []() { std::printf("\n[backfill] event backfill complete\n"); };
+
+    /* HW-B-C-03: onSystemTimeResponse already existed as a callback slot
+       on Communication but nothing registered a handler for it - this is
+       the minimum needed to observe the reply to [6] below. */
+    comm.callbacks.onSystemTimeResponse = [](const message::TimestampMessage &response)
+    { std::printf("\n[reply] system time response: timestamp=%u\n", response.timestamp); };
 
     management_command::ManagementCommand mgmt(comm);
 
@@ -231,6 +267,12 @@ int main()
                     break;
                 case '4':
                     printReport(store);
+                    break;
+                case '5':
+                    handleSetTempNormalRange(mgmt);
+                    break;
+                case '6':
+                    handleRequestSystemTime(mgmt);
                     break;
                 case 'q':
                 case 'Q':

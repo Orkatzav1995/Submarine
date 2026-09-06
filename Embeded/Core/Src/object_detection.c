@@ -6,6 +6,7 @@
 
 #include "object_detection.h"
 #include "event.h"
+#include "tx_queue.h"
 
 /* The raw reading from the previous poll, so a change (= activity) can
  * be detected. */
@@ -53,15 +54,20 @@ void ObjectDetection_Poll(uint32_t timestamp)
     {
         TimestampWithFlagMessage detection;
         uint8_t frame[64];
+        uint16_t frameLength;
 
         detection.timestamp = timestamp;
         detection.flag = (newReportedState == IR_DETECTED) ? 1 : 0;
 
         /* Event writes its own record, drives the LED/buzzer, and
-         * returns the CC-bound frame - discarded here, same "build but
-         * don't send" boundary every other Application module already
-         * has (no Communication/TX-queue module exists yet). */
-        (void)Event_OnObjectDetection(&detection, frame, sizeof(frame));
+         * returns the CC-bound frame - now enqueued at event priority
+         * (Sec 7) so CommTxTask actually sends it. */
+        frameLength = Event_OnObjectDetection(&detection, frame, sizeof(frame));
+
+        if (frameLength > 0)
+        {
+            TxQueue_EnqueueEvent(frame, frameLength);
+        }
 
         s_reportedState = newReportedState;
     }

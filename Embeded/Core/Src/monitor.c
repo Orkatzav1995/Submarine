@@ -11,6 +11,7 @@
 #include "configuration.h"
 #include "log.h"
 #include "event.h"
+#include "tx_queue.h"
 #include "cmsis_os.h"
 
 /* Last successfully-read DHT values - kept and reused whenever
@@ -24,11 +25,19 @@ static float s_lastHumidity = 0.0f;
  * as a genuine Normal->Error transition, not suppressed. */
 static uint8_t s_previousMode = MODE_NORMAL;
 
+/* The most recent sample Monitor_Sample() built, for Monitor_GetLastSample()
+ * (Keep-Alive, Sec 2.8, needs "the latest measurement + mode" independently
+ * of Monitor's own 5s cycle). Zero-initialized: timestamp=0, all floats
+ * 0.0f, mode=0=MODE_NORMAL (SystemMode's enum ordering, tlv_common.h) -
+ * the same safe default s_previousMode already uses. */
+static MeasurementSample s_lastSample;
+
 void Monitor_Init(void)
 {
     s_lastTemperature = 0.0f;
     s_lastHumidity = 0.0f;
     s_previousMode = MODE_NORMAL;
+    s_lastSample = (MeasurementSample){ 0 };
     DHT_Init();
 }
 
@@ -126,9 +135,29 @@ void Monitor_Sample(uint32_t timestamp, MeasurementSample *out_sample)
     overallMode = WorstOf4(tempMode, humidityMode, lightMode, batteryMode);
     out_sample->mode = (uint8_t)overallMode;
 
+    /* Keep-Alive (Sec 2.8) reads this back via Monitor_GetLastSample() on
+     * its own independent 6s cycle - captured here, now that every field
+     * of *out_sample is final for this cycle. */
+    s_lastSample = *out_sample;
+
     /* Sec 2.1: "sends measured data + resulting mode to Log" - every
      * cycle, unconditionally. */
     Log_Write(out_sample);
+
+    /* Sec 2.5's "data" priority tier (TAG_DATA_REPORT) needs a producer -
+     * Monitor's own periodic sample is exactly that, same "every cycle,
+     * unconditionally" cadence as the Log_Write() call right above.
+     * Enqueued at data priority (lowest, Sec 7) - CommTxTask sends it
+     * when nothing higher-priority (keepalive/event) is waiting. */
+    {
+        uint8_t dataFrame[32];
+        uint16_t dataFrameLength = Message_BuildDataReport(out_sample, dataFrame, sizeof(dataFrame));
+
+        if (dataFrameLength > 0)
+        {
+            TxQueue_EnqueueData(dataFrame, dataFrameLength);
+        }
+    }
 
     /* Sec 2.1: "on a mode change, sends measured values to Event" - only
      * when the mode actually differs from last cycle. */
@@ -136,17 +165,27 @@ void Monitor_Sample(uint32_t timestamp, MeasurementSample *out_sample)
     {
         ModeTransitionMessage transition;
         uint8_t frame[64];
+        uint16_t frameLength;
 
         transition.timestamp = timestamp;
         transition.oldMode = s_previousMode;
         transition.newMode = out_sample->mode;
 
         /* Event writes its own record, drives the LED/buzzer, and
-         * returns the CC-bound frame - discarded here, same "build but
-         * don't send" boundary Event itself already has (no
-         * Communication/TX-queue module exists yet to transmit it). */
-        (void)Event_OnModeTransition(&transition, frame, sizeof(frame));
+         * returns the CC-bound frame - now enqueued at event priority
+         * (Sec 7) so CommTxTask actually sends it. */
+        frameLength = Event_OnModeTransition(&transition, frame, sizeof(frame));
+
+        if (frameLength > 0)
+        {
+            TxQueue_EnqueueEvent(frame, frameLength);
+        }
 
         s_previousMode = out_sample->mode;
     }
+}
+
+void Monitor_GetLastSample(MeasurementSample *out_sample)
+{
+    *out_sample = s_lastSample;
 }

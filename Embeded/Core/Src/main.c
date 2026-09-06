@@ -34,6 +34,9 @@
 #include "init.h"
 #include "monitor.h"
 #include "object_detection.h"
+#include "keepalive.h"
+#include "communication.h"
+#include "tx_queue.h"
 #include "task.h" /* DIAGNOSTIC - raw FreeRTOS task API (uxTaskGetStackHighWaterMark, xPortGetFreeHeapSize) for the freeze investigation */
 /* USER CODE END Includes */
 
@@ -330,6 +333,31 @@ volatile uint32_t g_od_diag_before_button_check = 0;   /* step 4: right before E
 volatile uint32_t g_od_diag_after_button_check = 0;    /* step 5: right after Event_CheckAlarmButton() returns */
 volatile uint32_t g_od_diag_before_delay = 0;          /* step 6: right before osDelay(20) */
 volatile uint32_t g_od_diag_after_delay = 0;           /* step 7: right after osDelay(20) returns - if this stops but step 6 doesn't, osDelay() itself never returned */
+
+/* TEMPORARY Keep-Alive hardware test values - same debugger-watch
+   approach as every other module. g_keepalive_send_count confirms
+   KeepAliveTask is actually running its real 6s cycle;
+   g_keepalive_last_timestamp is the fresh RTC-derived value passed into
+   KeepAlive_Send() that cycle; g_keepalive_last_frame_length mirrors
+   KeepAlive_Send()'s return value (0 would mean Message_BuildKeepAlive()
+   failed - should never happen with a 32-byte buffer, but worth
+   watching). Remove once Keep-Alive is confirmed working. */
+volatile uint32_t g_keepalive_send_count = 0;
+volatile uint32_t g_keepalive_last_timestamp = 0;
+volatile uint16_t g_keepalive_last_frame_length = 0;
+
+/* TEMPORARY Communication dispatch hardware test values - same
+   debugger-watch approach as every other module. Mirrors
+   communication.c's own counters/last-tag getter after every dispatched
+   frame, so a real CC-sent command's effect can be watched live (e.g.
+   send a "set temp normal range" command and watch
+   g_dispatch_set_limit_count go up). Remove once dispatch is confirmed
+   working. */
+volatile uint8_t g_dispatch_last_tag = 0;
+volatile uint32_t g_dispatch_set_limit_count = 0;
+volatile uint32_t g_dispatch_system_time_request_count = 0;
+volatile uint32_t g_dispatch_deferred_count = 0;
+volatile uint32_t g_dispatch_unknown_tag_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -421,7 +449,12 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  /* Sec 7: the 3 statically-allocated TX-priority queues (see
+     tx_queue.c for why static, not heap-backed) - must exist before
+     CommTxTask/KeepAliveTask/etc. start using them, so created here,
+     before the scheduler starts. This marker is CubeMX's own
+     regeneration-safe spot for exactly this ("add queues, ..."). */
+  TxQueue_Init();
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -1335,6 +1368,31 @@ void StartTask05(void *argument)
       if (status == PROTOCOL_DECODE_FRAME_READY)
       {
         g_frames_decoded_ok++;
+
+        /* Sec 2.5: act on the decoded command. A fresh RTC read here
+           (only when a frame actually arrived, not every 20ms idle poll)
+           is a fast, non-blocking pair of register reads - it does not
+           risk starving KeepAliveTask the way a real delay would.
+           DateToEpoch() is the same static helper StartTask02/StartTask07
+           already use - no new helper needed, same translation unit. */
+        {
+          RTC_TimeTypeDef rtcTime;
+          RTC_DateTypeDef rtcDate;
+          uint32_t timestamp;
+
+          HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN);
+          HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN);
+          timestamp = DateToEpoch(2000 + rtcDate.Year, rtcDate.Month, rtcDate.Date,
+                                   rtcTime.Hours, rtcTime.Minutes, rtcTime.Seconds);
+
+          Communication_Dispatch(&decoded_frame, timestamp);
+
+          g_dispatch_last_tag = Communication_GetLastDispatchedTag();
+          g_dispatch_set_limit_count = Communication_GetSetLimitCount();
+          g_dispatch_system_time_request_count = Communication_GetSystemTimeRequestCount();
+          g_dispatch_deferred_count = Communication_GetDeferredCount();
+          g_dispatch_unknown_tag_count = Communication_GetUnknownTagCount();
+        }
       }
       else if (status == PROTOCOL_DECODE_ERROR)
       {
@@ -1363,33 +1421,34 @@ void StartTask05(void *argument)
 void StartTask06(void *argument)
 {
   /* USER CODE BEGIN StartTask06 */
-  /* TEMPORARY BRING-UP TEST ONLY.
-     This is not the final CommTxTask logic - there is no Message layer
-     and no priority-queue draining yet (see PROJECT_GUIDE.md). This just
-     sends a fixed test frame periodically so CommRxTask has something to
-     receive over a TX->RX loopback wire, to prove Transport+Protocol
-     work together on real hardware. Will be replaced once the Message
-     layer and the real priority queues exist.
+  /* Sec 7: CommTxTask is now the ONLY task that ever calls
+     Transport_UART_Send() - every sender (Keep-Alive, Event's callers,
+     Communication's system-time reply) hands its already-built frame to
+     tx_queue.c instead of sending directly. Each loop iteration checks
+     all 3 queues in strict priority order (TxQueue_DrainOne()) and
+     sends whatever it finds; if all 3 are empty, osDelay(1) yields -
+     same "don't busy-spin, don't starve lower-priority tasks" discipline
+     CommRxTask already uses on its own idle path (Sec 7).
 
-     (The raw-ASCII "HELLO STM32" sanity test that lived here has served
-     its purpose - it confirmed the raw USART2 -> ST-LINK VCP -> COM10
-     path works - and has been removed in favor of this real TLV test.) */
-  uint8_t test_value[] = { 0x01, 0x02, 0x03 };
-  uint8_t frame_buffer[32];
-  uint16_t frame_size;
+     (The fixed-tag-0x01 bring-up test frame that lived here has served
+     its purpose - it proved Transport+Protocol work together on real
+     hardware - and is removed now that real senders exist.) */
+  uint8_t frame_buffer[TX_QUEUE_MAX_ITEM_SIZE];
+  uint16_t frame_length;
 
   /* Infinite loop */
   for(;;)
   {
-    frame_size = Protocol_EncodeFrame(0x01, test_value, sizeof(test_value),
-                                       frame_buffer, sizeof(frame_buffer));
+    frame_length = TxQueue_DrainOne(frame_buffer, sizeof(frame_buffer));
 
-    if (frame_size > 0)
+    if (frame_length > 0)
     {
-      Transport_UART_Send(frame_buffer, frame_size, 100);
+      Transport_UART_Send(frame_buffer, frame_length, 100);
     }
-
-    osDelay(2000);
+    else
+    {
+      osDelay(1);
+    }
   }
   /* USER CODE END StartTask06 */
 }
@@ -1404,10 +1463,34 @@ void StartTask06(void *argument)
 void StartTask07(void *argument)
 {
   /* USER CODE BEGIN StartTask07 */
-  /* Infinite loop */
+  /* Sec 2.8: every 6 seconds, send a keepalive to the CC containing a
+     fresh timestamp plus Monitor's latest measurement data and mode.
+     Reads the RTC directly here, the same pattern StartTask02/InitTask
+     already established for Init_Start()'s timestamp - no Application
+     module in this project reads the RTC internally, the caller always
+     supplies a plain uint32_t timestamp (see keepalive.h). HAL_RTC_GetTime()
+     must be called before HAL_RTC_GetDate() even though only the date
+     feeds into DateToEpoch() below along with the time fields - this is
+     a real STM32 HAL requirement (reading the time unlocks the date
+     shadow registers), not a style choice. DateToEpoch() is the same
+     static helper StartTask02 already uses - no new helper needed, same
+     translation unit. */
   for(;;)
   {
-    osDelay(1);
+    RTC_TimeTypeDef rtcTime;
+    RTC_DateTypeDef rtcDate;
+    uint32_t timestamp;
+
+    HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN);
+    timestamp = DateToEpoch(2000 + rtcDate.Year, rtcDate.Month, rtcDate.Date,
+                             rtcTime.Hours, rtcTime.Minutes, rtcTime.Seconds);
+
+    g_keepalive_last_frame_length = KeepAlive_Send(timestamp);
+    g_keepalive_last_timestamp = timestamp;
+    g_keepalive_send_count++;
+
+    osDelay(6000);
   }
   /* USER CODE END StartTask07 */
 }
