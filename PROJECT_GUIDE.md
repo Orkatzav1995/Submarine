@@ -1097,8 +1097,8 @@ Sec 7's frozen `txQueueKeepAlive`(2) > `txQueueEvent`(8) > `txQueueData`(4), dra
 - `nm` confirms all new/changed symbols are genuinely present and linked: `Communication_Dispatch` + its 5 getters, `TxQueue_Init`/`TxQueue_EnqueueKeepAlive`/`_EnqueueEvent`/`_EnqueueData`/`TxQueue_DrainOne`, `Message_BuildDataReport`.
 - Confirmed via `git status`: `event.c`, `message.c`, and every task's priority/stack size are unchanged across both steps.
 
-#### EXACT CURRENT STATUS
-**B + C are both implemented and build/link verified, but NEITHER has been tested on real hardware yet.** No hardware test has been run since Keep-Alive's own verification (which predates both B and C). Do not claim or assume hardware correctness for dispatch, the queues, Event transmission, or the new Data-report producer until the test below has actually been run.
+#### EXACT CURRENT STATUS (SUPERSEDED - kept for history, see the new CURRENT stopping point after Sec 15's B+C narrative below for what's actually true now)
+~~**B + C are both implemented and build/link verified, but NEITHER has been tested on real hardware yet.**~~ **No longer accurate** - both B and C were subsequently hardware-tested (HW-B-C-01 through HW-B-C-05 all PASS, documented earlier in this same Sec 15 block's "Verified PASS" table and dedicated writeups). This sub-section and the "NEXT STEP" table right below it are pre-hardware-test planning notes, left in place as historical record of what was originally planned - do not treat them as the current state.
 
 #### NEXT STEP: the combined real-hardware test (not yet performed)
 This is what to do, and what to look at, when picking this up next:
@@ -1118,6 +1118,191 @@ This is what to do, and what to look at, when picking this up next:
 **After the hardware test passes**: update Sec 14's Communication and TX Priority Queue entries, and this section, to DONE/HARDWARE-VERIFIED. **If it doesn't pass**: this block is the reference point to diagnose from - it lists exactly what changed and why, so a failure can be isolated to a specific numbered test point above rather than re-investigated from scratch.
 
 **After B+C are hardware-confirmed, the same open fork from earlier this session still applies**: Ground Station + CC's Ethernet-facing module (still fully unstarted), FleetOOP (fully independent, not networked), or revisiting Watchdog (still paused, needs explicit instruction to unpause) - plus the two items explicitly deferred within B itself: `SET_RTC_DATETIME` dispatch (blocked on the RTC backup-register guard) and the 2 "retrieve by range" requests (blocked on a not-yet-built SD-card historical-retrieval feature).
+
+### CURRENT stopping point (2026-09-06/07, this is the real one, supersedes every block above): B+C hardware verification complete (6/8 PASS, 2 deferred). Ground Station work chosen as the next development item. Steps 1, 2, and 3 of 7 IMPLEMENTED and PC-TESTED. Step 4 (CC `GsCommunication` + TCP Server Transport) architecture is fully AGREED and documented - zero code written yet. Implementation begins next session.
+
+**Read this block first if picking the project up cold.**
+
+#### Completed
+
+**Previous LNC↔CC development and verification status** (full detail earlier in Sec 14/15): Protocol, Transport, Message layers, all 9 LNC spec modules except Watchdog (Configuration, Log, Event, Monitor, Object Detection, Init, Keep-Alive all hardware-verified), the full B (Communication/Command Dispatch) and C (TX Priority Queue) implementation, and the CC side (Communication, Management Command, DataStore, DataCollection, report_generator, `cc_main.cpp`) - all done. Real-hardware verification of B+C:
+- **HW-B-C-01 (Keep-Alive), HW-B-C-02 (Set-Limit), HW-B-C-03 (GetSystemTime round trip), HW-B-C-04 (Data Report), HW-B-C-05 (Event transmission): all PASS.**
+- **HW-B-C-08 (`CommTxTask` stack margin): PASS WITH WARNING** (~28% margin, stable, not touched per explicit instruction).
+- **HW-B-C-06 (TX Priority Ordering): remains INCONCLUSIVE / deferred.** Three real capture attempts (using the standalone `com10_capture.py` tool, session scratchpad, outside the project's source tree) never produced a genuine multi-tier contention window - every observed gap between different-tier frames was 100ms+, two orders of magnitude larger than the ~1-2ms drain latency needed to prove simultaneous pending. Not reclassified as PASS or FAIL - status unchanged, revisit later if desired.
+- **HW-B-C-07 (Queue-full / Drop Behavior): remains INCONCLUSIVE / deferred.** Analysis (not a live test) showed the existing production behavior cannot realistically fill any queue - `CommTxTask`'s drain rate (~1-2ms/item) is ~2 orders of magnitude faster than the fastest realistic producer rate (human-triggered IR events, 100ms+ apart), and the only way to slow the drain rate (disconnecting the UART) would very likely power-cycle the whole board rather than cleanly stall it. Status unchanged, revisit later if desired - the previously-proposed drop counter (test-support addition #3) was NOT added.
+- Temporary debug instrumentation added during the HW-B-C-02/03 investigation was fully reverted afterward - confirmed zero `g_dbg_*` references remain anywhere in the project.
+
+**Step 1 - CC Message Layer: IMPLEMENTED and PC-TESTED.**
+- Added `buildMeasurementChunkResponse()` / `buildEventChunkResponse()` to the existing `CentralComputer/include/message.h` / `CentralComputer/src/message.cpp` - CC can now build (not just parse) both chunked-response frame types, needed because CC will answer Ground Station's own range requests using data it already has locally.
+- Reuses the existing `MeasurementChunkResponse`/`EventChunkResponse` structs, existing tags, existing wire format - no new protocol mechanism.
+- Tests: extended `Tests/CCMessage/cc_message_test.cpp` with `testBuildMeasurementChunkResponse()`/`testBuildEventChunkResponse()` (byte-for-byte payload checks, round trips through the existing parsers, over-limit rejection, zero-record edge case, build-side description truncation) - **80/80 checks PASS** (61 pre-existing + 19 new).
+- Regression: `communication_test.exe` 29/29 PASS, `management_command_test.exe` 14/14 PASS, `cc_main.cpp` recompiles clean (same single pre-existing, unrelated `ModeName`-unused warning as before). Zero new warnings/errors. `git diff` confirmed only the 3 intended files changed.
+
+**Step 2 - Ground Station Message Layer: IMPLEMENTED and PC-TESTED.**
+- New, fully independent `GroundStation/include/message.h` / `GroundStation/src/message.cpp` - does **not** include or link against CC's own `message.h/.cpp` (same established precedent as the LNC/CC pair never sharing a single Message-layer implementation; only the tag vocabulary `tlv_common.h` and the raw codec `Common/TLVCodec` are shared).
+- Implements: `buildGetMeasurementsByRangeRequest()`/`buildGetEventsByRangeRequest()` (GS -> CC, identical wire layout to CC's own request builders) and `parseMeasurementChunkResponse()`/`parseEventChunkResponse()` (CC -> GS, identical wire layout to CC's own parsers).
+- Tests: new `Tests/GSMessage/gs_message_test.cpp` (request byte-for-byte layout, both chunk-response parsers' field decoding, wrong-tag rejection, non-multiple-of-record-size rejection, zero-record edge case, max record count for both chunk types, a no-null-terminator description bounded-read safety check, and a dedicated CRC-corruption test proving the real `tlv::Decoder` reports `Error`) - **32/32 checks PASS**.
+- CC regression re-confirmed: `cc_message_test.exe` still **80/80 PASS**. Zero new warnings/errors. `git status`/`git diff` confirmed only new files were added (`GroundStation/`, `Tests/GSMessage/`) - zero CC files touched.
+
+**Step 3 - TCP/Ethernet Transport: IMPLEMENTED and PC-TESTED.**
+- New `GroundStation/include/tcp_transport.h` / `GroundStation/src/tcp_transport.cpp` - `namespace transport { class TcpSocket }`, mirroring `CentralComputer/serial_transport.h/.cpp`'s exact shape and rationale (non-copyable, owns one OS handle stored as `void*` in the header specifically to keep `<winsock2.h>`'s own types/macros out of every file that includes the header - same reasoning `SerialPort` already documents for `<windows.h>`/`HANDLE`).
+- **API**: `bool connect(const std::string &host, uint16_t port)`, `void close()`, `bool isConnected() const`, `bool send(const std::vector<uint8_t> &data, uint32_t timeoutMs)`, `bool receiveByte(uint8_t &outByte, uint32_t timeoutMs)`. `connect`/`isConnected` replace `SerialPort`'s `open`/`isOpen` (TCP's natural vocabulary); `close`/`send`/`receiveByte` keep identical names for cross-class consistency.
+- **Scope, confirmed by construction**: `TcpSocket` only ever handles raw `std::vector<uint8_t>` bytes - zero knowledge of TLV, tags, or message types. It is a **client-only** class (GS connects out to the CC, per the already-documented open decision that the CC listens) - it deliberately has no `listen()`/`accept()` - a listening counterpart is the CC's own, separate, not-yet-built concern (Step 4+).
+- **Platform/implementation**: Win32 Winsock2 (`socket`/`connect`/`send`/`recv`/`closesocket`, `SO_SNDTIMEO`/`SO_RCVTIMEO` for timeouts) - this codebase is already Windows-only (confirmed via `serial_transport.cpp`'s own `<windows.h>` usage), so this follows the same platform choice rather than introducing a second one. `WSAStartup`/`WSACleanup` are called per `connect()`/`close()` pair rather than through a separate global-init mechanism - Winsock reference-counts these internally, so this is safe with multiple instances and is the simplest correct option (Sec 12).
+- **Tests**: new `Tests/TcpTransport/tcp_transport_test.cpp` (18 checks) - unlike `serial_transport_test.cpp` (which *must* use real hardware, since there's no software substitute for a serial cable), this test uses a **real local TCP loopback** (127.0.0.1, OS-assigned free port via binding to port 0): a minimal raw-Winsock listener written *only* inside this test file (never in `GroundStation/src/` - kept out of production code deliberately, matching `tcp_transport.h`'s own "does NOT listen/accept" boundary) gives the real client class a real peer to connect to, send to, and receive from. Covers: connecting where nothing listens (fails cleanly), a malformed address (fails cleanly), a full real connect+send+byte-for-byte echo receive round trip, `receiveByte()`'s timeout never hanging past a reasonable margin, all operations on a never-connected socket failing cleanly without crashing, and reconnecting the same object after `close()`. **18/18 checks PASS**, first run, no fix-up needed.
+- Regression re-confirmed: `cc_message_test.exe` still **80/80 PASS**, `gs_message_test.exe` still **32/32 PASS**. Zero new warnings/errors (`-Wall` clean on both the class and its test). `git status` confirmed only new files added (`GroundStation/include/tcp_transport.h`, `GroundStation/src/tcp_transport.cpp`, `Tests/TcpTransport/`) - zero existing files touched, including the already-completed Steps 1-2 files.
+- **Intentionally deferred, not part of Step 3**: any listening/accepting counterpart (CC's own future job, Step 4), any wiring into `GsCommunication` or `cc_main.cpp`, any message-layer coupling (`TcpSocket` never includes or references `message.h`).
+- **Assumption made, not yet validated against a real second machine**: loopback (127.0.0.1) is assumed sufficient to stand in for Sec 1.2/4's "simulated Ethernet on the same PC" - consistent with how the LNC's real UART link is already confined to one PC's peripherals; no cross-machine networking is in scope anywhere in this project.
+
+**Step 4 - CC-side `GsCommunication` + TCP Server Transport: ARCHITECTURE/DESIGN AGREED, NOT YET IMPLEMENTED.** Full inspection and design proposal completed and approved (2026-09-06/07); **no source or header file has been created or modified for Step 4** - this is a documentation-only checkpoint, confirmed via `git status` showing zero working-tree changes beyond `PROJECT_GUIDE.md` itself.
+
+**Files that will be created (not yet created):**
+- `CentralComputer/include/tcp_transport.h` / `CentralComputer/src/tcp_transport.cpp` - CC's own, independent TCP transport implementation (same filename as `GroundStation/include/tcp_transport.h`/`.cpp`, but a separate implementation under CC's own tree - extends the same "each side gets its own independent implementation" precedent Steps 1-2 already established for the Message layer, now applied to Transport).
+- `CentralComputer/include/gs_communication.h` / `CentralComputer/src/gs_communication.cpp` - the new `gs_communication::GsCommunication` class, alongside every other existing CC module in the same directory.
+
+**Existing file that will need a small, additive parser addition (not yet made):**
+- `CentralComputer/include/message.h` / `CentralComputer/src/message.cpp` (Step 1's file) - two new functions, `parseGetMeasurementsByRangeRequest()` and `parseGetEventsByRangeRequest()`, reusing the **existing** `TimeRangeMessage` struct (no new struct). CC already has *builders* for these two tags (used when CC asks the LNC for a backfill); it has never needed *parsers* for them before, because it never received them - now GS sends them *to* CC. Same "missing other half of an already-existing message type" pattern Step 1 itself already used for the chunk-response builders. **Explicitly approved** - this is the one place Step 4 touches an already-completed step's file.
+
+**Proposed API (design only, not yet implemented):**
+
+```cpp
+// CentralComputer/include/tcp_transport.h
+namespace transport {
+class TcpServerSocket {
+public:
+    TcpServerSocket() = default; ~TcpServerSocket();
+    TcpServerSocket(const TcpServerSocket&) = delete;
+    TcpServerSocket& operator=(const TcpServerSocket&) = delete;
+
+    bool startListening(uint16_t port);   // binds all local interfaces + listen()
+    void close();                          // stops listening AND drops any connected client
+    bool isListening() const;
+    bool isClientConnected() const;
+
+    bool tryAcceptClient();  // non-blocking; true if a NEW client was just accepted this call
+
+    bool send(const std::vector<uint8_t> &data, uint32_t timeoutMs);
+    bool receiveByte(uint8_t &outByte, uint32_t timeoutMs);
+private:
+    void *listenHandle_ = nullptr;
+    void *clientHandle_ = nullptr;
+};
+}
+```
+
+```cpp
+// CentralComputer/include/gs_communication.h
+namespace gs_communication {
+class GsCommunication {
+public:
+    explicit GsCommunication(data_store::DataStore &dataStore);  // non-owning reference, same pattern as ManagementCommand holding Communication&
+
+    uint32_t framesDispatched = 0;
+    uint32_t decodeErrors = 0;
+
+    bool startListening(uint16_t port);
+    void close();
+    bool isListening() const;
+    bool isClientConnected() const;
+
+    void poll();                    // accept-if-pending, then decode-one-byte-if-connected
+    void feedByte(uint8_t byte);    // exposed for tests, same seam Communication::feedByte() already provides
+
+private:
+    void dispatch(const tlv::Frame &frame);
+    void sendMeasurementsForRange(const message::TimeRangeMessage &request);
+    void sendEventsForRange(const message::TimeRangeMessage &request);
+
+    transport::TcpServerSocket serverTransport_;
+    tlv::Decoder decoder_;
+    data_store::DataStore &dataStore_;
+};
+}
+```
+
+**Data flow (GS -> TCP -> CC -> DataStore, and back):**
+```
+GS: message::buildGetMeasurementsByRangeRequest() -> TcpSocket::send()
+      -> [TCP, port 5000] ->
+CC: TcpServerSocket::receiveByte() (via GsCommunication::poll())
+      -> tlv::Decoder -> GsCommunication::feedByte() -> dispatch()
+      -> case TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST:
+           message::parseGetMeasurementsByRangeRequest()  [NEW, small addition to Step 1's file]
+           -> sendMeasurementsForRange(request):
+                dataStore_.getMeasurementsInRange(startTime, endTime)   [existing, unchanged]
+                -> split into groups of <= MAX_MEASUREMENTS_PER_CHUNK
+                -> for each group: message::buildMeasurementChunkResponse()  [existing, Step 1, unchanged]
+                     echoing request.requestId back in every chunk
+                -> serverTransport_.send() each built frame
+      -> [TCP] ->
+GS: TcpSocket::receiveByte() -> its own tlv::Decoder -> message::parseMeasurementChunkResponse()  [existing, Step 2, unchanged]
+      -> accumulate chunks until moreDataFlag == false -> display
+```
+(`TAG_GET_EVENTS_BY_RANGE_REQUEST` follows the identical path via `sendEventsForRange()`/`getEventsInRange()`/`buildEventChunkResponse()`.)
+
+**All agreed decisions, recorded for implementation:**
+- CC-side transport is one class, `transport::TcpServerSocket`, not a separate Listener+Connection pair - GS is a single-operator tool, no multi-client support needed (Sec 12: don't design for a hypothetical future requirement).
+- **TCP port: `5000`.**
+- **Reconnection is supported**: `close()`ing/losing a client drops only the client connection, not the listening socket - CC keeps listening indefinitely for a fresh GS connection, matching CC's role as the long-running server.
+- **Fully synchronous handling inside `dispatch()`** - no `DataCollection`-style async request/chunk correlation class, because CC already holds all of GS's requested data locally (unlike the genuinely-asynchronous LNC relationship, where the LNC takes real time to reply over many future `poll()` calls).
+- **`poll()` does both jobs in one call**: accept a pending client if none is connected, then make at most one byte of decode progress if one is - mirrors `communication::Communication::poll()`'s single do-everything-non-blocking shape exactly, for the simplest possible future integration into `cc_main.cpp`'s existing loop.
+- **`GsCommunication` holds `data_store::DataStore &dataStore_` directly** (non-owning reference) - no wrapper class, since `DataStore`'s two range-query methods are already public and read-only in effect.
+- **Important asymmetry, stated explicitly so it isn't re-litigated later**: GS is the *requester* and generates its own `requestId`; CC only ever echoes it back in every response chunk. Unlike `DataCollection`'s CC->LNC direction (where CC, as requester there, must generate its own `nextRequestId_`), `GsCommunication` needs **no** request-ID-generation logic at all.
+- Reuses, unchanged: `TimeRangeMessage`, `MeasurementChunkResponse`/`EventChunkResponse`, `buildMeasurementChunkResponse`/`buildEventChunkResponse`, `Common/TLVCodec`. No new protocol structures.
+
+**What is implemented vs. still pending, stated plainly:**
+- Implemented: nothing for Step 4 - Steps 1-3 remain exactly as documented above (message layers both sides, GS's client transport).
+- Pending: `tcp_transport.h/.cpp` (CC-side), `gs_communication.h/.cpp`, the 2 new CC-side parsers, all associated tests, and any `cc_main.cpp` wiring (the latter was already flagged in the original 7-step plan as Step 5+ territory, not Step 4).
+
+#### STOPPING POINT for Step 4 (2026-09-06/07)
+Architecture fully designed and approved. **Zero code written.** `git status` at the end of this session shows no source/header changes beyond what Steps 1-3 already produced - only `PROJECT_GUIDE.md` differs. Confirmed by explicit re-check before closing this session.
+
+#### Next Session / Step 4 Implementation - exactly what to do next
+1. Create `CentralComputer/include/tcp_transport.h` / `.cpp` (`transport::TcpServerSocket`) - Winsock2, mirroring `GroundStation/tcp_transport.cpp`'s implementation style (per-call `SO_RCVTIMEO`/`SO_SNDTIMEO`, `WSAStartup`/`WSACleanup` per connect-lifecycle) but adding `startListening`/`tryAcceptClient` instead of `connect`.
+2. Add `parseGetMeasurementsByRangeRequest()`/`parseGetEventsByRangeRequest()` to `CentralComputer/message.h/.cpp`, reusing `TimeRangeMessage` - mirror Step 1's exact "reverse an existing builder into its missing parser" pattern, extend `Tests/CCMessage/cc_message_test.cpp` accordingly, confirm the existing 80 checks still pass alongside the new ones.
+3. Create `CentralComputer/include/gs_communication.h` / `.cpp` per the API above.
+4. New `Tests/GsCommunication/gs_communication_test.cpp` - real localhost loopback (matching Step 3's precedent: a real client, not a mock), covering: server startup/bind, successful connection, failed-connection scenarios, send/receive, disconnect + reconnect, and a full request -> `DataStore` -> chunked-response round trip using a real (or in-memory) `DataStore`.
+5. Regression: re-run `cc_message_test.exe`, `gs_message_test.exe`, `tcp_transport_test.exe` - all must stay green alongside the new suite.
+6. Update `PROJECT_GUIDE.md` with real implementation + test results, only after tests actually pass - do not mark Step 4 complete before that.
+7. **Still explicitly out of scope for Step 4 itself**: `cc_main.cpp` wiring, Step 5 (GS-side dispatch/orchestration layer), Step 6 (already covered by Step 4's own `sendMeasurementsForRange`/`sendEventsForRange`, so may collapse - revisit when Step 5 is reached), Step 7 (`gs_main.cpp`).
+
+#### Current architecture (what exists today between LNC, CC, and the future Ground Station)
+
+```
+LNC  <---- UART (real, hardware-verified) ---->  CC
+                                                   |
+                                            (DataStore already
+                                             holds all measurement/
+                                             event data locally)
+                                                   |
+GS  <---- TCP/Ethernet (transport layer done, NOT wired to anything yet) ---->  CC
+```
+- **LNC <-> CC over UART**: fully real, fully hardware-verified (B+C, above).
+- **GS <-> CC over TCP/Ethernet**: the **Message layer** (Steps 1-2) and GS's own **client-side Transport layer** (Step 3) are both complete and PC-tested independently. `TcpSocket` can genuinely connect, send, and receive over a real TCP socket (proven via loopback) - but **nothing wires it to the Message layer, and no CC-side listener exists at all**. No `GsCommunication` class exists, and `cc_main.cpp` has not been touched. GS's message-layer and transport-layer code are each tested, standalone libraries so far, not yet connected to each other or to anything CC-side.
+
+#### Remaining development plan (approved order, unchanged since the design proposal)
+
+1. ~~Step 1 - CC Message Layer~~ ✅ **DONE**
+2. ~~Step 2 - Ground Station Message Layer~~ ✅ **DONE**
+3. ~~Step 3 - TCP/Ethernet Transport~~ ✅ **DONE** - `transport::TcpSocket` (GS's own client-side transport, `GroundStation/include/tcp_transport.h`/`.cpp`), 18/18 tests passing against a real local loopback connection. See the full writeup above.
+4. **Step 4 - CC `gs_communication::GsCommunication` + TCP Server Transport** ⏳ **NEXT, ARCHITECTURE AGREED, NOT YET IMPLEMENTED** (depends on Steps 1 and 3) - full design documented above (files, API, data flow, all agreed decisions). Zero code written. See "Next Session / Step 4 Implementation" above for the exact implementation order.
+5. Step 5 - GS-side communication/dispatch layer (depends on Steps 2 and 3)
+6. Step 6 - Connect CC's `GsCommunication` callbacks to `DataStore` queries + chunked sending
+7. Step 7 - `GroundStation/gs_main.cpp` (the actual client console app)
+
+**Open design decisions already identified (from the approved design proposal, not yet finalized in code):**
+- Class/namespace name for the new CC-side module: **`gs_communication::GsCommunication`** (not the stale `GsCommunicationManager` name found in Sec 5 - that predates this project's actual, consistently-used naming convention).
+- GS gets its own independent `message.h/.cpp` (**done**, Step 2) rather than sharing CC's.
+- **CC's own Sec 3 "Log" module (operational/audit logging to files) is explicitly deferred** - confirmed unrelated to Ground Station's actual requirements, since Sec 4's "log data" maps to measurement data (already served by the existing `DataStore`/`report_generator`), not CC's own activity log.
+- **CC-side GS handling is intended to be fully synchronous** - unlike `DataCollection`'s LNC-facing backfill logic (which must correlate replies arriving asynchronously over many future `poll()` calls, because the LNC takes time to answer), CC already has all of GS's requested data locally, so it can query, chunk, and send the entire reply within the same callback that received the request, with no `RequestId` pending-state bookkeeping needed on the CC side.
+- **TCP port number and connection model** (GS connects to CC, i.e., CC listens) - not yet decided, to be finalized during Step 3.
+- **CC-side glue location** (inline in `cc_main.cpp` vs. a small new file, for wiring `GsCommunication`'s callbacks to `DataStore`) - a minor choice, deferred to Step 6.
+
+**Do NOT, until explicitly instructed:**
+- Start Step 3 or later.
+- Revisit HW-B-C-06 or HW-B-C-07's status.
+- Add the previously-proposed `tx_queue.c` drop counter or any other new instrumentation.
+- Touch Watchdog (still paused, Open Question #2).
 
 ### Already verified (do not re-litigate without new evidence)
 - CC builds and sends protocol-correct bytes for at least `setRtcDateTime` (byte-for-byte, three independent methods).

@@ -336,6 +336,169 @@ static void testEventChunkResponse()
           "an over-long description is truncated to EVENT_DESCRIPTION_SIZE-1 characters");
 }
 
+static std::vector<uint8_t> buildEventRecordValueBytes(uint32_t timestamp, uint8_t eventType, const std::string &description)
+{
+    std::vector<uint8_t> bytes;
+    appendUint32LE(bytes, timestamp);
+    bytes.push_back(eventType);
+    std::vector<uint8_t> descriptionField(EVENT_DESCRIPTION_SIZE, 0);
+    size_t copyLength = std::min(description.size(), static_cast<size_t>(EVENT_DESCRIPTION_SIZE - 1));
+    std::memcpy(descriptionField.data(), description.data(), copyLength);
+    bytes.insert(bytes.end(), descriptionField.begin(), descriptionField.end());
+    return bytes;
+}
+
+static void testBuildMeasurementChunkResponse()
+{
+    std::printf("\nTest: buildMeasurementChunkResponse\n");
+
+    message::MeasurementChunkResponse response;
+    response.requestId = 9;
+    response.chunkSeq = 0x1234;
+    response.moreDataFlag = true;
+    message::MeasurementSample sample1;
+    sample1.timestamp = 1000;
+    sample1.temperature = 20.0f;
+    sample1.humidity = 50.0f;
+    sample1.light = 300.0f;
+    sample1.battery = 3.7f;
+    sample1.mode = MODE_NORMAL;
+    message::MeasurementSample sample2;
+    sample2.timestamp = 2000;
+    sample2.temperature = 21.0f;
+    sample2.humidity = 51.0f;
+    sample2.light = 310.0f;
+    sample2.battery = 3.6f;
+    sample2.mode = MODE_WARNING;
+    response.records = {sample1, sample2};
+
+    std::vector<uint8_t> built = message::buildMeasurementChunkResponse(response);
+    check(!built.empty(), "build succeeds (non-empty result)");
+
+    tlv::Frame frame = decodeFrame(built);
+    check(frame.tag == TAG_MEASUREMENT_CHUNK_RESPONSE, "correct tag");
+
+    /* Exact byte-for-byte payload check against hand-built bytes - not just
+       "it parses back", the actual wire bytes must match. */
+    std::vector<uint8_t> expectedValue;
+    expectedValue.push_back(9);
+    expectedValue.push_back(0x34);
+    expectedValue.push_back(0x12);
+    expectedValue.push_back(1);
+    std::vector<uint8_t> record1 = buildMeasurementSampleValueBytes(1000, 20.0f, 50.0f, 300.0f, 3.7f, MODE_NORMAL);
+    std::vector<uint8_t> record2 = buildMeasurementSampleValueBytes(2000, 21.0f, 51.0f, 310.0f, 3.6f, MODE_WARNING);
+    expectedValue.insert(expectedValue.end(), record1.begin(), record1.end());
+    expectedValue.insert(expectedValue.end(), record2.begin(), record2.end());
+    check(frame.value == expectedValue, "payload bytes match exactly, byte-for-byte");
+
+    /* Round trip through the already-tested parser must reproduce the input. */
+    std::optional<message::MeasurementChunkResponse> roundTrip = message::parseMeasurementChunkResponse(frame);
+    check(roundTrip.has_value(), "round-trips through parseMeasurementChunkResponse");
+    if (roundTrip)
+    {
+        check(roundTrip->requestId == response.requestId && roundTrip->chunkSeq == response.chunkSeq
+                  && roundTrip->moreDataFlag == response.moreDataFlag && roundTrip->records.size() == 2,
+              "round-tripped header matches original");
+        check(roundTrip->records[0].timestamp == 1000 && roundTrip->records[0].mode == MODE_NORMAL
+                  && roundTrip->records[1].timestamp == 2000 && roundTrip->records[1].mode == MODE_WARNING,
+              "round-tripped records match original");
+    }
+
+    /* More records than MAX_MEASUREMENTS_PER_CHUNK is rejected (empty vector). */
+    message::MeasurementChunkResponse tooMany;
+    tooMany.records.assign(MAX_MEASUREMENTS_PER_CHUNK + 1, sample1);
+    check(message::buildMeasurementChunkResponse(tooMany).empty(),
+          "rejects more than MAX_MEASUREMENTS_PER_CHUNK records");
+
+    /* Zero records (a valid, empty final chunk) still builds a correct 4-byte-payload frame. */
+    message::MeasurementChunkResponse empty;
+    empty.requestId = 1;
+    empty.chunkSeq = 0;
+    empty.moreDataFlag = false;
+    std::vector<uint8_t> emptyBuilt = message::buildMeasurementChunkResponse(empty);
+    tlv::Frame emptyFrame = decodeFrame(emptyBuilt);
+    check(emptyFrame.value.size() == 4, "zero records still builds a valid 4-byte (header-only) payload");
+    std::optional<message::MeasurementChunkResponse> emptyParsed = message::parseMeasurementChunkResponse(emptyFrame);
+    check(emptyParsed.has_value() && emptyParsed->records.empty(), "zero-record chunk round-trips correctly");
+}
+
+static void testBuildEventChunkResponse()
+{
+    std::printf("\nTest: buildEventChunkResponse\n");
+
+    message::EventChunkResponse response;
+    response.requestId = 3;
+    response.chunkSeq = 5;
+    response.moreDataFlag = false;
+    message::EventRecord record1;
+    record1.timestamp = 111;
+    record1.eventType = TAG_EVENT_STARTUP;
+    record1.description = "Startup after watchdog reset";
+    message::EventRecord record2;
+    record2.timestamp = 222;
+    record2.eventType = TAG_EVENT_OBJECT_DETECTION;
+    record2.description = "Object detected";
+    response.records = {record1, record2};
+
+    std::vector<uint8_t> built = message::buildEventChunkResponse(response);
+    check(!built.empty(), "build succeeds (non-empty result)");
+
+    tlv::Frame frame = decodeFrame(built);
+    check(frame.tag == TAG_EVENT_CHUNK_RESPONSE, "correct tag");
+
+    std::vector<uint8_t> expectedValue;
+    expectedValue.push_back(3);
+    expectedValue.push_back(0x05);
+    expectedValue.push_back(0x00);
+    expectedValue.push_back(0);
+    std::vector<uint8_t> bytes1 = buildEventRecordValueBytes(111, TAG_EVENT_STARTUP, "Startup after watchdog reset");
+    std::vector<uint8_t> bytes2 = buildEventRecordValueBytes(222, TAG_EVENT_OBJECT_DETECTION, "Object detected");
+    expectedValue.insert(expectedValue.end(), bytes1.begin(), bytes1.end());
+    expectedValue.insert(expectedValue.end(), bytes2.begin(), bytes2.end());
+    check(frame.value == expectedValue, "payload bytes match exactly, byte-for-byte");
+
+    std::optional<message::EventChunkResponse> roundTrip = message::parseEventChunkResponse(frame);
+    check(roundTrip.has_value(), "round-trips through parseEventChunkResponse");
+    if (roundTrip)
+    {
+        check(roundTrip->requestId == 3 && roundTrip->chunkSeq == 5 && roundTrip->moreDataFlag == false
+                  && roundTrip->records.size() == 2,
+              "round-tripped header matches original");
+        check(roundTrip->records[0].description == "Startup after watchdog reset"
+                  && roundTrip->records[1].description == "Object detected",
+              "round-tripped descriptions match original");
+    }
+
+    /* More records than MAX_EVENTS_PER_CHUNK is rejected (empty vector). */
+    message::EventChunkResponse tooMany;
+    tooMany.records.assign(MAX_EVENTS_PER_CHUNK + 1, record1);
+    check(message::buildEventChunkResponse(tooMany).empty(), "rejects more than MAX_EVENTS_PER_CHUNK records");
+
+    /* An over-long description is truncated on the BUILD side too - the
+       wire bytes themselves must be truncated+null-padded, not just the
+       already-tested parse-side behavior. */
+    message::EventChunkResponse longDesc;
+    longDesc.requestId = 1;
+    message::EventRecord longRecord;
+    longRecord.timestamp = 1;
+    longRecord.eventType = TAG_EVENT_CONFIG_CHANGED;
+    longRecord.description = std::string(EVENT_DESCRIPTION_SIZE + 20, 'X');
+    longDesc.records = {longRecord};
+    tlv::Frame longFrame = decodeFrame(message::buildEventChunkResponse(longDesc));
+    std::optional<message::EventChunkResponse> longParsed = message::parseEventChunkResponse(longFrame);
+    check(longParsed.has_value() && longParsed->records[0].description.size() == EVENT_DESCRIPTION_SIZE - 1,
+          "an over-long description is truncated to EVENT_DESCRIPTION_SIZE-1 characters when building");
+
+    /* Zero records still builds a correct 4-byte-payload frame. */
+    message::EventChunkResponse empty;
+    empty.requestId = 7;
+    empty.moreDataFlag = true;
+    tlv::Frame emptyFrame = decodeFrame(message::buildEventChunkResponse(empty));
+    check(emptyFrame.value.size() == 4, "zero records still builds a valid 4-byte (header-only) payload");
+    std::optional<message::EventChunkResponse> emptyParsed = message::parseEventChunkResponse(emptyFrame);
+    check(emptyParsed.has_value() && emptyParsed->records.empty(), "zero-record chunk round-trips correctly");
+}
+
 static void testTemperatureRangeBuilders()
 {
     std::printf("\nTest: buildSetTempNormalRange / buildSetTempWarningRange\n");
@@ -405,6 +568,8 @@ int main()
     testTimeRangeBuilders();
     testMeasurementChunkResponse();
     testEventChunkResponse();
+    testBuildMeasurementChunkResponse();
+    testBuildEventChunkResponse();
     testTemperatureRangeBuilders();
     testSingleLimitBuilders();
     testWrongLengthIsRejected();

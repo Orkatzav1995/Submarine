@@ -10,9 +10,12 @@
  *   Struct names/shapes match the LNC's own message.h where the same
  *   fields appear on both sides, for readability across the two codebases.
  *
- *   NOT covered yet: TAG_MEASUREMENT_CHUNK_RESPONSE / TAG_EVENT_CHUNK_RESPONSE
- *   - see PROJECT_GUIDE.md for why (unresolved chunk-size and event
- *   description-field questions).
+ *   TAG_MEASUREMENT_CHUNK_RESPONSE / TAG_EVENT_CHUNK_RESPONSE: the CC only
+ *   ever needed to parse these (replies arriving from the LNC) until now.
+ *   The build side (buildMeasurementChunkResponse/buildEventChunkResponse
+ *   below) exists for the Ground Station work - the CC answers GS's own
+ *   range requests using data it already has locally, so it needs to
+ *   build these same two frame types itself. See PROJECT_GUIDE.md.
  *
  * Layer:
  *   Message (Transport -> Protocol -> Message -> Application)
@@ -159,6 +162,21 @@ struct EventChunkResponse
  */
 std::optional<MeasurementChunkResponse> parseMeasurementChunkResponse(const tlv::Frame &frame);
 std::optional<EventChunkResponse> parseEventChunkResponse(const tlv::Frame &frame);
+
+/*
+ * CC -> GS direction (new): the CC already has all the requested data
+ * locally (its own DataStore), so it builds these same two frame types
+ * itself when answering a Ground Station range request. Both return an
+ * empty vector if "response.records" holds more than the max allowed per
+ * chunk (MAX_MEASUREMENTS_PER_CHUNK / MAX_EVENTS_PER_CHUNK, tlv_common.h) -
+ * same failure convention as tlv::encodeFrame's other failure cases.
+ * Wire format is identical to what parseMeasurementChunkResponse/
+ * parseEventChunkResponse already expect - this is the LNC's existing
+ * Message_BuildMeasurementChunkResponse/Message_BuildEventChunkResponse
+ * layout, ported to this struct-based C++ API.
+ */
+std::vector<uint8_t> buildMeasurementChunkResponse(const MeasurementChunkResponse &response);
+std::vector<uint8_t> buildEventChunkResponse(const EventChunkResponse &response);
 
 /* ============================================================
  * CC -> LNC: configuration "set limit" commands

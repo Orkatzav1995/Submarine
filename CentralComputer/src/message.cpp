@@ -52,6 +52,18 @@ void appendFloatLE(std::vector<uint8_t> &out, float v)
     }
 }
 
+/* Shared by buildMeasurementChunkResponse - the build-side counterpart of
+   deserializeMeasurementSample below, same 21-byte wire layout. */
+void serializeMeasurementSample(std::vector<uint8_t> &out, const MeasurementSample &sample)
+{
+    appendUint32LE(out, sample.timestamp);
+    appendFloatLE(out, sample.temperature);
+    appendFloatLE(out, sample.humidity);
+    appendFloatLE(out, sample.light);
+    appendFloatLE(out, sample.battery);
+    out.push_back(sample.mode);
+}
+
 /* Shared by parseKeepAlive and parseDataReport - both carry identical fields. */
 MeasurementSample deserializeMeasurementSample(const std::vector<uint8_t> &value)
 {
@@ -258,6 +270,79 @@ std::optional<EventChunkResponse> parseEventChunkResponse(const tlv::Frame &fram
     }
 
     return response;
+}
+
+namespace {
+
+/* Build-side counterpart of parseEventChunkResponse's record-decoding loop:
+   writes EVENT_RECORD_SIZE wire bytes (timestamp + eventType + a
+   description field truncated at EVENT_DESCRIPTION_SIZE-1 characters and
+   null-padded for the rest), matching the LNC's SerializeEventRecord()
+   exactly - same truncate-then-pad approach, guaranteeing the field is
+   always null-terminated within its own bounds. */
+void serializeEventRecord(std::vector<uint8_t> &out, const EventRecord &record)
+{
+    appendUint32LE(out, record.timestamp);
+    out.push_back(record.eventType);
+
+    size_t descriptionLength = record.description.size();
+    if (descriptionLength > EVENT_DESCRIPTION_SIZE - 1)
+    {
+        descriptionLength = EVENT_DESCRIPTION_SIZE - 1;
+    }
+
+    for (size_t i = 0; i < descriptionLength; i++)
+    {
+        out.push_back(static_cast<uint8_t>(record.description[i]));
+    }
+    for (size_t i = descriptionLength; i < EVENT_DESCRIPTION_SIZE; i++)
+    {
+        out.push_back(0);
+    }
+}
+
+}  // namespace
+
+std::vector<uint8_t> buildMeasurementChunkResponse(const MeasurementChunkResponse &response)
+{
+    if (response.records.size() > MAX_MEASUREMENTS_PER_CHUNK)
+    {
+        return {};  // empty vector signals failure - too many records for one chunk
+    }
+
+    std::vector<uint8_t> value;
+    value.push_back(response.requestId);
+    value.push_back(static_cast<uint8_t>(response.chunkSeq & 0xFF));
+    value.push_back(static_cast<uint8_t>((response.chunkSeq >> 8) & 0xFF));
+    value.push_back(response.moreDataFlag ? 1 : 0);
+
+    for (const MeasurementSample &sample : response.records)
+    {
+        serializeMeasurementSample(value, sample);
+    }
+
+    return tlv::encodeFrame(TAG_MEASUREMENT_CHUNK_RESPONSE, value);
+}
+
+std::vector<uint8_t> buildEventChunkResponse(const EventChunkResponse &response)
+{
+    if (response.records.size() > MAX_EVENTS_PER_CHUNK)
+    {
+        return {};  // empty vector signals failure - too many records for one chunk
+    }
+
+    std::vector<uint8_t> value;
+    value.push_back(response.requestId);
+    value.push_back(static_cast<uint8_t>(response.chunkSeq & 0xFF));
+    value.push_back(static_cast<uint8_t>((response.chunkSeq >> 8) & 0xFF));
+    value.push_back(response.moreDataFlag ? 1 : 0);
+
+    for (const EventRecord &record : response.records)
+    {
+        serializeEventRecord(value, record);
+    }
+
+    return tlv::encodeFrame(TAG_EVENT_CHUNK_RESPONSE, value);
 }
 
 std::vector<uint8_t> buildSetTempNormalRange(const TemperatureRangeMessage &message)
