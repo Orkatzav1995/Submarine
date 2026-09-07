@@ -227,6 +227,53 @@ static void testTimeRangeBuilders()
     check(eventsFrame.tag == TAG_GET_EVENTS_BY_RANGE_REQUEST, "correct tag (distinct from measurements request)");
 }
 
+static void testParseGetRangeRequests()
+{
+    std::printf("\nTest: parseGetMeasurementsByRangeRequest / parseGetEventsByRangeRequest\n");
+
+    /* Step 4b: CC never needed to parse these two before (it only built
+       them, to ask the LNC for a backfill) - now the Ground Station sends
+       them TO CC, so this is the "missing other half," same pattern as
+       Step 1's buildMeasurementChunkResponse/buildEventChunkResponse. */
+    message::TimeRangeMessage original;
+    original.requestId = 42;
+    original.startTime = 1700000000u;
+    original.endTime = 1700086400u;
+
+    /* Round trip through the real build+decode+parse path - same wire
+       bytes a real Ground Station would send. */
+    tlv::Frame measurementsFrame = decodeFrame(message::buildGetMeasurementsByRangeRequest(original));
+    std::optional<message::TimeRangeMessage> parsedMeasurements =
+        message::parseGetMeasurementsByRangeRequest(measurementsFrame);
+    check(parsedMeasurements.has_value(), "parseGetMeasurementsByRangeRequest accepts a well-formed frame");
+    check(parsedMeasurements->requestId == original.requestId, "requestId round-trips correctly (measurements)");
+    check(parsedMeasurements->startTime == original.startTime, "startTime round-trips correctly (measurements)");
+    check(parsedMeasurements->endTime == original.endTime, "endTime round-trips correctly (measurements)");
+
+    tlv::Frame eventsFrame = decodeFrame(message::buildGetEventsByRangeRequest(original));
+    std::optional<message::TimeRangeMessage> parsedEvents = message::parseGetEventsByRangeRequest(eventsFrame);
+    check(parsedEvents.has_value(), "parseGetEventsByRangeRequest accepts a well-formed frame");
+    check(parsedEvents->requestId == original.requestId, "requestId round-trips correctly (events)");
+    check(parsedEvents->startTime == original.startTime, "startTime round-trips correctly (events)");
+    check(parsedEvents->endTime == original.endTime, "endTime round-trips correctly (events)");
+
+    /* Wrong tag: each parser must reject the other request's frame. */
+    check(!message::parseGetMeasurementsByRangeRequest(eventsFrame).has_value(),
+          "parseGetMeasurementsByRangeRequest rejects a GET_EVENTS_BY_RANGE_REQUEST frame (wrong tag)");
+    check(!message::parseGetEventsByRangeRequest(measurementsFrame).has_value(),
+          "parseGetEventsByRangeRequest rejects a GET_MEASUREMENTS_BY_RANGE_REQUEST frame (wrong tag)");
+
+    /* Wrong length: valid tag, but a payload that isn't exactly 9 bytes
+       (RequestId(1) + StartTime(4) + EndTime(4)). */
+    std::vector<uint8_t> tooShortValue = {0x01, 0x02, 0x03};
+    tlv::Frame tooShortMeasurements = decodeFrame(tlv::encodeFrame(TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST, tooShortValue));
+    tlv::Frame tooShortEvents = decodeFrame(tlv::encodeFrame(TAG_GET_EVENTS_BY_RANGE_REQUEST, tooShortValue));
+    check(!message::parseGetMeasurementsByRangeRequest(tooShortMeasurements).has_value(),
+          "parseGetMeasurementsByRangeRequest rejects a too-short payload");
+    check(!message::parseGetEventsByRangeRequest(tooShortEvents).has_value(),
+          "parseGetEventsByRangeRequest rejects a too-short payload");
+}
+
 static std::vector<uint8_t> buildMeasurementSampleValueBytes(uint32_t timestamp, float temperature, float humidity,
                                                                float light, float battery, uint8_t mode)
 {
@@ -566,6 +613,7 @@ int main()
     testModeTransitionMessage();
     testSetRtcDateTimeAndGetSystemTimeRequest();
     testTimeRangeBuilders();
+    testParseGetRangeRequests();
     testMeasurementChunkResponse();
     testEventChunkResponse();
     testBuildMeasurementChunkResponse();

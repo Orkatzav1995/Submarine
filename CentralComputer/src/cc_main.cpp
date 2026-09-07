@@ -21,11 +21,15 @@
  *     DataCollection is built, so it's ready to receive inserts the
  *     moment DataCollection registers its callbacks).
  *   - Open the real COM10 link.
- *   - Run a single-threaded loop: poll() the connection (a real blocking
- *     ReadFile with a short timeout underneath - no busy-spinning, no
- *     osDelay-equivalent needed, unlike the LNC's bare-metal polling) and
- *     check for a keypress without blocking (_kbhit()/_getch() - this
- *     codebase is already Windows-only, see serial_transport.cpp).
+ *   - Listen for a Ground Station connection on TCP port 5000
+ *     (gs_communication::GsCommunication, sharing the same DataStore the
+ *     LNC side already fills - see PROJECT_GUIDE.md's Step 4).
+ *   - Run a single-threaded loop: poll() both the LNC connection (a real
+ *     blocking ReadFile with a short timeout underneath - no
+ *     busy-spinning, no osDelay-equivalent needed, unlike the LNC's
+ *     bare-metal polling) and the Ground Station connection, and check
+ *     for a keypress without blocking (_kbhit()/_getch() - this codebase
+ *     is already Windows-only, see serial_transport.cpp).
  *   - Offer a tiny menu so the real hardware can actually be exercised on
  *     demand, since the LNC currently has no application layer of its own
  *     (see the menu actions' own comments below for exactly what each one
@@ -47,6 +51,7 @@
 #include "communication.h"
 #include "data_collection.h"
 #include "data_store.h"
+#include "gs_communication.h"
 #include "management_command.h"
 #include "report_generator.h"
 #include "tlv_common.h"
@@ -60,6 +65,7 @@ constexpr const char *kComPortName = "COM10";
 constexpr uint32_t kBaudRate = 115200;
 constexpr const char *kDatabasePath = "central_computer.db";
 constexpr uint32_t kSecondsPerDay = 24u * 60u * 60u;
+constexpr uint16_t kGsPort = 5000; /* PROJECT_GUIDE.md's Step 4 agreed production port */
 
 uint32_t CurrentUnixTime()
 {
@@ -112,7 +118,8 @@ void printMenu()
     std::fflush(stdout);
 }
 
-void printStatus(const communication::Communication &comm, const data_collection::DataCollection &collection)
+void printStatus(const communication::Communication &comm, const data_collection::DataCollection &collection,
+                  const gs_communication::GsCommunication &gsComm)
 {
     std::printf("\n--- Status ---\n");
     std::printf("Port open: %s\n", comm.isOpen() ? "yes" : "no");
@@ -120,6 +127,10 @@ void printStatus(const communication::Communication &comm, const data_collection
     std::printf("Decode errors: %u\n", comm.decodeErrors);
     std::printf("Measurement backfill in progress: %s\n", collection.isMeasurementBackfillInProgress() ? "yes" : "no");
     std::printf("Event backfill in progress: %s\n", collection.isEventBackfillInProgress() ? "yes" : "no");
+    std::printf("GS listening: %s\n", gsComm.isListening() ? "yes" : "no");
+    std::printf("GS client connected: %s\n", gsComm.isClientConnected() ? "yes" : "no");
+    std::printf("GS frames dispatched: %u\n", gsComm.framesDispatched);
+    std::printf("GS decode errors: %u\n", gsComm.decodeErrors);
 }
 
 void printReport(data_store::DataStore &store)
@@ -234,6 +245,20 @@ int main()
 
     management_command::ManagementCommand mgmt(comm);
 
+    /* GS's server side shares the same DataStore the LNC side already
+       fills - a GS query answers from the exact same measurement/event
+       history CC has collected, not a second, separate store. */
+    gs_communication::GsCommunication gsComm(store);
+    if (gsComm.startListening(kGsPort))
+    {
+        std::printf("Listening for Ground Station on TCP port %u.\n", kGsPort);
+    }
+    else
+    {
+        std::printf("WARNING: could not listen on TCP port %u - continuing without Ground Station support.\n",
+                    kGsPort);
+    }
+
     if (comm.open(kComPortName, kBaudRate))
     {
         std::printf("Connected to %s at %u baud.\n", kComPortName, kBaudRate);
@@ -250,6 +275,7 @@ int main()
     while (running)
     {
         comm.poll();
+        gsComm.poll();
 
         if (_kbhit())
         {
@@ -263,7 +289,7 @@ int main()
                     handleRequestBackfill(collection);
                     break;
                 case '3':
-                    printStatus(comm, collection);
+                    printStatus(comm, collection, gsComm);
                     break;
                 case '4':
                     printReport(store);
@@ -291,6 +317,7 @@ int main()
 
     std::printf("\nClosing...\n");
     comm.close();
+    gsComm.close();
     store.close();
     return 0;
 }

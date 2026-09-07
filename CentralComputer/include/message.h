@@ -119,6 +119,17 @@ struct TimeRangeMessage
 std::vector<uint8_t> buildGetMeasurementsByRangeRequest(const TimeRangeMessage &message);
 std::vector<uint8_t> buildGetEventsByRangeRequest(const TimeRangeMessage &message);
 
+/*
+ * GS -> CC direction (new): CC never needed to *parse* these two requests
+ * before - it only ever built them itself, to ask the LNC for a backfill.
+ * Now the Ground Station sends them *to* CC, so CC needs the missing other
+ * half. Same struct, same wire layout, same tags - both reject a frame
+ * with the wrong tag or a payload that isn't exactly 9 bytes
+ * (RequestId(1) + StartTime(4) + EndTime(4)).
+ */
+std::optional<TimeRangeMessage> parseGetMeasurementsByRangeRequest(const tlv::Frame &frame);
+std::optional<TimeRangeMessage> parseGetEventsByRangeRequest(const tlv::Frame &frame);
+
 /* ============================================================
  * Chunked bulk-transfer responses (LNC -> CC)
  * See Common/Protocol/tlv_common.h for the sizing rationale.

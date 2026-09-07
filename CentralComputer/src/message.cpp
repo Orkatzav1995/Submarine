@@ -186,6 +186,32 @@ std::vector<uint8_t> buildGetEventsByRangeRequest(const TimeRangeMessage &messag
     return tlv::encodeFrame(TAG_GET_EVENTS_BY_RANGE_REQUEST, value);
 }
 
+std::optional<TimeRangeMessage> parseGetMeasurementsByRangeRequest(const tlv::Frame &frame)
+{
+    if (frame.tag != TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST || frame.value.size() != 9)
+    {
+        return std::nullopt;
+    }
+    TimeRangeMessage message;
+    message.requestId = frame.value[0];
+    message.startTime = readUint32LE(&frame.value[1]);
+    message.endTime = readUint32LE(&frame.value[5]);
+    return message;
+}
+
+std::optional<TimeRangeMessage> parseGetEventsByRangeRequest(const tlv::Frame &frame)
+{
+    if (frame.tag != TAG_GET_EVENTS_BY_RANGE_REQUEST || frame.value.size() != 9)
+    {
+        return std::nullopt;
+    }
+    TimeRangeMessage message;
+    message.requestId = frame.value[0];
+    message.startTime = readUint32LE(&frame.value[1]);
+    message.endTime = readUint32LE(&frame.value[5]);
+    return message;
+}
+
 namespace {
 
 constexpr size_t kChunkHeaderSize = 4; /* RequestId(1) + ChunkSeq(2) + MoreDataFlag(1) */
