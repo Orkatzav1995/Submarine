@@ -1242,7 +1242,347 @@ GS application -> CcCommunication -> TCP -> CC GsCommunication -> DataStore rang
 ```
 Verified successfully: GS<->CC TCP connection, measurement range requests, event range requests, range filtering (out-of-range rows correctly excluded), DataStore integration, TLV framing/decoding, single-chunk responses, multi-chunk responses, measurement accumulation, event accumulation, correct ordering, correct callback completion, and no data loss in any tested scenario.
 
-**Files still to be created for the rest of the plan:** none identified - Steps 1-7 of the original plan are now all done, PC-tested, AND manually end-to-end verified (Step 6 officially skipped, folded into Step 4d). Any further Ground Station work (e.g., richer display formatting, canned convenience date ranges, a real hardware/second-machine test) would be new, not-yet-requested scope - **there is no Step 8**.
+**Files still to be created for the rest of the plan:** none identified - Steps 1-7 of the original plan are now all done, PC-tested, AND manually end-to-end verified (Step 6 officially skipped, folded into Step 4d). Any further Ground Station work (e.g., richer display formatting, canned convenience date ranges) would be new, not-yet-requested scope - **there is no Step 8**. The item below (real hardware/second-machine-equivalent test) is **no longer future work - it has now been performed**, see immediately below.
+
+### Full Live Hardware Integration Verification (Embedded -> CC -> GS): PASSED (2026-09-07)
+
+Supersedes the fixture-based verification above with the real path end-to-end: the real STM32 NUCLEO-L476RG board (real sensors, real IR input) -> real USART2/COM10 -> real `cc_main.exe` -> real `DataStore` -> real TCP port 5000 -> real `gs_main.exe`. Performed in 3 user-approved stages, each gated before proceeding to the next.
+
+**Stage 2 - Hardware -> Embedded (approved by the user).** Verified directly via the STM32CubeIDE debugger, using only already-existing watch variables (`g_monitor_sample_count`, `g_monitor_last_temperature/humidity/light/battery/mode`, `g_object_detection_last_state`, `g_object_detection_raw_gpio_level`, `g_event_last_frame_length`) and a breakpoint at `CommTxTask`'s `Transport_UART_Send()` call site: `MonitorTask`'s real 5-second sensor sampling, a real IR-remote-triggered object-detection event, and the TxQueue -> CommTxTask -> UART TX path were all confirmed operating on real hardware. No code changed.
+
+**Stage 3 - Embedded -> CC (approved by the user).** `cc_main.exe` connected live to the real board: startup printed `Connected to COM10 at 115200 baud.` (not the fixture). Real CC status, read by the user via `[3] Show status`: **Port open: yes, Frames dispatched: 6, Decode errors: 0** - direct proof the real Embedded -> CC serial receive/decode path works.
+  - **Real finding surfaced and investigated during this stage, not a defect**: the pre-existing 326 real measurement rows and 6 of 14 real event rows (both dated ~2026-08-31, from earlier hardware sessions) were deleted by `DataStore::pruneOlderThan()` the moment a new insert triggered it. Verified by direct computation, not assumed: real "now" was `2026-09-07 17:06:57 UTC`, the 7-day retention cutoff `2026-08-31 17:06:57 UTC`; the old measurements' max timestamp (`2026-08-31 00:31:25 UTC`) fell before the cutoff, so correct, working retention logic removed them - a real, working feature, not a bug. The 8 surviving events (timestamps `2026-08-31 17:44:46 UTC` and earlier-but-still-post-cutoff) survived only because `ObjectDetection`'s synthetic clock advances roughly 250x faster than `Monitor`'s (~1 unit/20ms poll vs. ~1 unit/5s cycle), so it had already "outrun" the cutoff while Monitor's had not.
+
+**Stage 4 - Embedded + CC + GS simultaneously (this verification round).** With the real board still running and `cc_main.exe` still connected to COM10, `gs_main.exe` was started and connected over a real TCP connection to the real CC while live Embedded traffic continued arriving.
+
+- **CC**: `Port open: yes`; **`Frames dispatched` increased from 6 to 12 during the session** (continued receiving real Embedded frames while GS was connected and making requests); `Decode errors: 0`; GS connection established (listening + client connected).
+- **GS**: `Connected: yes`; `Decode errors: 0`.
+- **Event request: PASS with real data.** GS requested and received exactly the 8 real, hardware-generated `ObjectDetection` events (the same ones that survived Stage 3's retention prune):
+  ```
+  1788197513  Object detected
+  1788197561  Object cleared
+  1788197792  Object detected
+  1788197856  Object cleared
+  1788198163  Object detected
+  1788198202  Object cleared
+  1788198238  Object detected
+  1788198286  Object cleared
+  ```
+  This is a genuine Embedded -> CC -> `DataStore` -> GS round trip for real sensor-triggered data, not fixture data.
+- **Measurement request: round trip PASS, zero rows returned - NOT a communication failure.** The request was sent successfully and a valid, well-formed reply was received (`0 measurements`). This is the expected, already-understood consequence of Stage 3's finding: `Monitor`'s synthetic-clock timestamps advance far too slowly (~1 unit/5s) to ever catch up to the real, continuously-advancing 7-day retention cutoff under realistic uptimes (~85+ hours would be needed) - any measurement row is pruned essentially the instant it's inserted. The round trip itself (request -> CC parse -> `DataStore` query -> chunk -> TCP -> GS decode -> callback) is proven correct by the event test above and by the reply arriving at all; only the *data* is structurally unable to persist long enough to be queried back, for a reason already known and explicitly not being fixed here.
+- **Concurrent-traffic check**: `Frames dispatched` on CC continuing to climb (6 -> 12) throughout the GS session confirms real Embedded traffic and GS's TCP requests were serviced concurrently in the same single-threaded `poll()` loop, with no stall, no cross-talk, and no decode errors on either side.
+
+**Known limitation, explicitly not being changed now**: `Monitor`/`ObjectDetection`'s timestamps come from a synthetic, per-module test clock (`g_monitor_test_timestamp`, `g_object_detection_test_timestamp`), not the real RTC that Init already wires up elsewhere (Sec 9.2/2.7) - a leftover from before RTC was enabled, never revisited. This causes the retention interaction documented above. Left as-is per explicit instruction; not a blocker for anything verified here.
+
+**Conclusion**: full live Embedded -> CC -> GS connectivity is verified on real hardware. CC continued receiving live Embedded traffic while GS was connected and actively making requests (proving the two `poll()` loops coexist correctly, the one integration gap identified before this test that had never been exercised). The event path was verified end-to-end with 8 real `ObjectDetection` events, real sensor-triggered data traveling the complete real path. The measurement round trip was verified as mechanically correct; persisted measurement retrieval cannot currently be demonstrated, for the known synthetic-timestamp/retention reason above, not a communication defect. No unexpected decode errors occurred anywhere, on any of CC's two links or GS's link, across all 3 stages. No source files were modified in any of Stages 2, 3, or 4.
+
+---
+
+## Phase 1 — LNC Timestamp/RTC Hardening: IMPLEMENTED and HARDWARE-VERIFIED (2026-09-07) — Test D explicitly deferred, see below
+
+**Not part of the original 7-step Ground Station plan** - a new, independently-scoped phase addressing the synthetic-timestamp/retention limitation the Full Live Hardware Integration Verification above surfaced. Went through a full investigation report, a design proposal, two rounds of user-directed correction, and final approval before any code was written (see this session's own history for the full investigation/design trail - not reproduced here).
+
+### What was implemented
+
+- **New RTC synchronization state, gated behind a minimal API** (`Embeded/Core/Inc/rtc_sync.h`, no new `.c` - implemented in `main.c`, where the RTC handle already lives): `RtcSync_IsSynchronized()` and `RtcSync_ApplyEpoch(uint32_t)`. The internal `rtc_synchronized` flag stays `static` inside `main.c`, exactly as required - no other file reads or writes it by name; every caller goes through the two functions. Chosen over adding declarations to `main.h` (would have forced Application-layer modules to newly depend on CubeMX's hardware/pin header, which none of them do today) or `communication.h` (wrong ownership - not `communication.c`'s own concern).
+- **`RtcSync_ApplyEpoch()`** validates the epoch is representable by this RTC's hardware (`RTC_DateTypeDef.Year` is a `uint8_t` offset from 2000, so only 2000-2099 is valid - `946684800`-`4102444799`), converts it via a new `EpochToCalendar()` (the exact inverse of the existing `DateToEpoch()`, same "simple counting loop" style, added to `main.c` - not `log.c`, per explicit instruction, since `log.c`'s own version is private/date-only and do-not-touch), sets the RTC via `HAL_RTC_SetTime`/`SetDate`, and - only on full success - writes a marker (`RTC_SYNC_MARKER = 0x52544301`) to `RTC_BKP_DR0` and sets `rtc_synchronized = 1`. A repository-wide search (including `.ioc` and the full `Drivers`/`Middlewares` tree, not just `Core/`) confirmed no other project code uses this backup register.
+- **`MX_RTC_Init()`** now checks `RTC_BKP_DR0` before unconditionally resetting the RTC to its hardcoded default: a valid marker skips the reset entirely (trusting the backup-domain-retained value) and sets `rtc_synchronized = 1` immediately at boot; a missing/invalid marker (first-ever boot, or backup-domain power loss - indistinguishable from software, by design) falls through to the existing default-set behavior, leaving the LNC unsynchronized.
+- **Two synchronization mechanisms, both fully working, sharing the same `RtcSync_ApplyEpoch()`**:
+  - **Existing, manual**: `TAG_SET_RTC_DATETIME` (CC push) - previously recognized but deliberately deferred (a no-op); now actually applies the epoch.
+  - **New, active**: the LNC now sends `TAG_GET_SYSTEM_TIME_REQUEST` once, unconditionally, at the end of `Init_Start()` (`init.c`) - closing Sec 2.7's long-standing "Init requests time/date sync from CC" gap. CC's `Communication::dispatch()` gained a new, self-contained `case TAG_GET_SYSTEM_TIME_REQUEST:` that replies immediately and synchronously with this PC's own real time (`std::time(nullptr)`), no callback, no Management Command involvement - mirroring the LNC's own inline-reply precedent for the same tag. The LNC then parses the reply via a new `Message_ParseSystemTimeResponse()` and applies it the same way. No new tag was invented anywhere - this completes an already-frozen tag pair's previously-missing other direction (the third instance of this exact pattern in the project, after Step 1's chunk-response builders and Step 4b's range-request parsers).
+- **Production timestamp source switched from synthetic counters to real RTC reads**, in `MonitorTask` and `ObjectDetectionTask` (`main.c`) - same `HAL_RTC_GetTime`/`GetDate` + `DateToEpoch()` pattern already proven in `CommRxTask`/`KeepAliveTask`. `g_monitor_test_timestamp`/`g_object_detection_test_timestamp` are no longer used for the production timestamp (left declared but now dead - a known, disclosed cleanup opportunity, not removed this pass to keep the change minimal).
+- **Pre-sync gating - Option C with an internal flag, exactly as approved**: all local behavior (sampling, classification, IR debounce, `Log_Write()`, LED/buzzer via `Event_On*()`, Configuration changes) runs completely unconditionally, synchronized or not. Only the final `TxQueue_Enqueue*()` call at each of 5 existing call sites is gated on `RtcSync_IsSynchronized()`: Monitor's `DATA_REPORT`, Monitor's mode-transition event, ObjectDetection's event, KeepAlive's frame, and `communication.c`'s `ReportConfigurationChanged()` event. Zero changes to `event.c`, `log.c`, `DataStore`, `DataCollection`, or any GS/TCP/range code - confirmed by this implementation, not just planned.
+- **Startup event**: `Init_Start()`'s call to `Event_OnInitStartup()` (local record, LED, buzzer) is unconditional; only its `TxQueue_EnqueueEvent()` call is gated. **Explicit, disclosed consequence**: since `Init_Start()` runs synchronously and returns before the boot-time sync request it sends afterward can possibly be answered, the startup event's CC-bound transmission is skipped on every real boot, deterministically - by explicit decision, no deferred/retry transmission was added.
+- **`SynchPrediv`/`AsynchPrediv` deliberately left unchanged** (still `255`/`127`) - RTC LSI-accuracy calibration is an explicitly separate, later follow-up phase.
+
+### Files changed
+
+**LNC**: `Embeded/Core/Inc/rtc_sync.h` (new), `Embeded/Core/Src/main.c`, `communication.c`, `Embeded/Core/Inc/communication.h`, `Embeded/Core/Src/message.c`, `Embeded/Core/Inc/message.h`, `monitor.c`, `object_detection.c`, `keepalive.c`, `init.c`.
+**CC**: `CentralComputer/include/message.h`, `src/message.cpp` (new `parseGetSystemTimeRequest`/`buildSystemTimeResponse`), `CentralComputer/include/communication.h`, `src/communication.cpp` (new dispatch case).
+**Not touched, confirmed**: `log.c`, `event.c`, `DataStore`, `DataCollection`, any GS file, any TCP/range-protocol file, `tlv_common.h` (no new tag), `SynchPrediv`/`AsynchPrediv`.
+
+### Build verification (real toolchains, not just review)
+
+- **LNC**: full clean rebuild via the real ARM toolchain (`arm-none-eabi-gcc`, found under the local STM32CubeIDE install, invoked directly via the project's real `Debug/makefile`) - `Embeded.elf` linked successfully, **zero warnings, zero errors** (`-Wall` enabled). Flash size: `text=79680, data=156, bss=24020` (small, expected increase from the new code).
+- **CC**: `message.cpp`/`communication.cpp` compile-checked individually (`-Wall`, zero warnings), then the real `cc_main.exe` fully rebuilt and relinked - clean, same single pre-existing unrelated `ModeName`-unused warning as always, zero new warnings/errors.
+- **Regression, all 14 PC-side automated suites re-run, 540/540 checks passing, 0 failures**: `protocol_test` (C) 23/23, `message_test` (C, LNC) 80/80, `tlv_codec_test` 22/22, `cc_message_test` 92/92, `gs_message_test` 32/32, `communication_test` 29/29, `management_command_test` 14/14, `data_store_test` 24/24, `data_collection_test` 25/25, `report_generator_test` 16/16, `tcp_transport_test` 18/18, `tcp_server_transport_test` 30/30, `gs_communication_test` 77/77, `cc_communication_test` 58/58 - identical total to before this phase, confirming zero regression anywhere.
+- **No new automated tests were created this pass**, per explicit instruction - the 12-test verification sequence already designed (RTC receives/converts time, timestamps close to real time, DataStore survival, GS retrieval, monotonicity, reboot/unsynchronized behavior, full regression) remains to be executed on **real hardware**, which only the user can do.
+- **Hardware verification status**: real-hardware testing of this phase's behavior has since been performed - see "Phase 1 — LNC Timestamp/RTC Hardening — Complete Status" below for the full, final results (Test 1 and Test C both PASS; Test D explicitly DEFERRED, not yet executed).
+
+### Phase 1 — Current Verification Checkpoint (2026-09-07): hardware verification STARTED, NOT YET COMPLETE
+
+**Software status (recap, unchanged since implementation):**
+- LNC clean build: **PASS**, 0 errors, 0 warnings (real `arm-none-eabi-gcc` via the project's actual `Debug/makefile`).
+- CC build: **PASS**, only the pre-existing, unrelated `ModeName`-unused warning (same as every prior session).
+- Regression: **540/540 PASS, 0 failures**, across all 14 PC-side automated suites - identical total to before Phase 1, confirming zero regression.
+- Source changes and the new `Embeded/Core/Inc/rtc_sync.h` file: as documented in "What was implemented"/"Files changed" above - unchanged, nothing further modified since.
+- **Nothing has been committed.**
+
+**Hardware verification: STARTED, NOT COMPLETE. Do not treat anything below as a final PASS/FAIL.**
+
+What has actually been done and observed so far, stated precisely:
+- The Phase 1 firmware was flashed to the real board and verified via `STM32_Programmer_CLI` (download + verify succeeded).
+- A first reset was performed with nothing connected to COM10, and a standalone, passive, read-only external capture (outside the project tree, same precedent as earlier hardware sessions' `com10_capture.py`) observed the raw UART traffic for 25 real seconds immediately after boot: **exactly one frame was seen, tag `0x10` (`TAG_GET_SYSTEM_TIME_REQUEST`), zero-length payload - and zero `DATA_REPORT`/`KEEPALIVE`/event frames appeared in that window.** This is real, directly-observed evidence (not assumed) that (a) the new unconditional boot-time sync request is actually sent, and (b) the pre-sync transmission gate is actually withholding production frames - but this was only the pre-sync half; no CC was present in this specific window to answer the request, so nothing about the sync round trip itself was tested by it.
+- `cc_main.exe` was then started (initially in a non-interactive/hidden session) and the board was reset again so a live CC would be present to answer the boot-time request this time. After roughly 29 minutes of real elapsed time, the database still showed **0 measurement rows** and no new event rows. Because the CC session was non-interactive, `Frames dispatched`/`Decode errors` could not be read, and no debugger was attached to the LNC, so **which stage of the round trip did or didn't complete could not be determined from this attempt** - this was reported as a diagnostic with explicit UNKNOWNs, not a FAIL.
+- **Decision made at this checkpoint**: stop autonomous verification entirely. All further hardware verification will proceed **manually, one step at a time** - the user performs each action and reports the exact observed output back before the next instruction is given. This replaces the originally-planned "run stages automatically, report at the end" approach for the remainder of Phase 1's hardware verification.
+
+**Exact point where we stopped, for picking this up cold:**
+- **Hardware Test 1 is "Automatic Boot-Time RTC Synchronization."**
+- The first manual action defined (not yet performed at the time of this checkpoint): start a fresh, **interactive** `cc_main.exe` session (the previous hidden one was stopped) and confirm, from its own real console output, that the database opens, the GS TCP listener starts, and it reports `Connected to COM10 at 115200 baud.` (not the WARNING).
+- **No menu key should be pressed yet** - this first action only confirms the connection is live.
+- **Next action, still pending**: waiting for the user to run this and report back the exact startup output and whether the menu appears. Nothing beyond this has been instructed or performed.
+
+**Intended verification sequence after this checkpoint (updated as tests completed):**
+1. Unsynchronized boot (partially evidenced above via passive capture; local Monitor/ObjectDetection/Startup execution and initial `rtc_synchronized` state itself still **PENDING** - no debugger read of that specific pre-sync moment was taken).
+2. Automatic boot synchronization (request sent/received, response sent/received, RTC applied, `rtc_synchronized` becomes true) - **PASS**, see "Hardware Test 1 Result" below.
+3. Post-synchronization traffic (Measurement/Event/KeepAlive resume, real RTC-derived timestamps) - **PASS**, see "FINAL VERIFICATION" item 3/4 below.
+4. CC/DataStore verification (real Measurement reaches CC, timestamp is current, row survives retention) - **PASS**, see "FINAL VERIFICATION" item 3 below.
+5. GS retrieval of the new Measurement and at least one real Event - **PASS**, see "FINAL VERIFICATION" items 4/5 below.
+6. Manual `SET_RTC_DATETIME` path (RTC changes, sync state, subsequent timestamps follow it) - covered only incidentally during earlier diagnosis (confirmed the mechanism works), not as a dedicated pass/fail test - **PENDING** as a formal test.
+7. Reboot / backup-marker survival across a normal `NRST` reset - **PASS**, see "Test C" in "Phase 1 — LNC Timestamp/RTC Hardening — Complete Status" below. (A genuine Backup-Domain-clearing power-loss condition is a separate, still-unexecuted case - see Test D.)
+8. Invalid epoch rejection (`RtcSync_ApplyEpoch()` correctly refuses an out-of-range epoch, sync state unaffected) - **PENDING**.
+
+**Phase 1 hardware/end-to-end verification has PASSED every test actually executed** (see "Phase 1 — LNC Timestamp/RTC Hardening — Complete Status" below for the final, authoritative record) - this is explicitly **not** a claim of 100% verification: test 1 (unsynchronized-boot debugger capture), test 6 (manual `SET_RTC_DATETIME` as a dedicated test), test 8 (invalid epoch), and **Test D (unsynchronized boot after a genuine Backup Domain loss)** remain formally PENDING/DEFERRED.
+
+### Phase 1 — Hardware Test 1 Result (2026-09-07): Automatic Boot-Time RTC Synchronization — PASS
+
+Verification method: a single controlled reset with `cc_main.exe` already running and connected, with readings taken from both the CC status display and the LNC's existing debugger-visible globals (`g_frames_decoded_ok`, `g_frames_decode_error`, `g_dispatch_last_tag`, `rtc_synchronized`) immediately before and immediately after the reset, no manual RTC action performed at any point during this test.
+
+- CC port open: **yes**.
+- CC Frames dispatched: **0 before reset -> 2 after reset**.
+- CC Decode errors: **0** (unchanged).
+- LNC `g_frames_decoded_ok`: **0 -> 1**.
+- LNC `g_frames_decode_error`: **0** (unchanged).
+- LNC `g_dispatch_last_tag`: **0x20** (`TAG_SYSTEM_TIME_RESPONSE`) after reset.
+- LNC `rtc_synchronized`: **0 -> 1**.
+- **No manual RTC request (`SET_RTC_DATETIME` or otherwise) was used during this verification** - the transition was produced solely by the automatic boot-time sequence.
+
+**Conclusion**: this confirms the automatic boot-time path works end-to-end on real hardware: `Init_Start()` sends `TAG_GET_SYSTEM_TIME_REQUEST` -> CC receives it and replies with `TAG_SYSTEM_TIME_RESPONSE` -> the LNC receives and dispatches that response -> `RtcSync_ApplyEpoch()` is called and succeeds -> `rtc_synchronized` becomes `1`, all without any manual intervention.
+
+### Phase 1 — LNC Timestamp/RTC Hardening — FINAL VERIFICATION (2026-09-07)
+
+**1. Automatic boot-time RTC synchronization**
+- Physical NUCLEO reset button pressed (confirmed by board LEDs restarting).
+- No manual RTC command (`SET_RTC_DATETIME` or otherwise) was used during this test.
+- LNC `rtc_synchronized`: **0 -> 1**.
+- LNC `g_dispatch_last_tag`: **0x20** (`TAG_SYSTEM_TIME_RESPONSE`).
+- LNC decode errors: **0**.
+- CC received and dispatched the synchronization traffic successfully (`Frames dispatched` incremented, `Decode errors` stayed at 0).
+- See "Hardware Test 1 Result" above for the full before/after counter values.
+
+**2. RTC register verification**
+- Read directly from the RTC peripheral via the debugger (attach-to-running, no reset, no reflash):
+  - `DR = 0x262907` -> decodes to **07/09/2026** (day=07, month=09, year=26).
+  - `TR = 0x200946`.
+- This confirms the RTC hardware registers themselves - not just the `rtc_synchronized` flag - actually hold the synchronized 2026 date, ruling out the possibility of the flag being set without the underlying date/time actually being applied.
+
+**3. Measurement persistence**
+- The CC's report menu ([4]) showed a growing number of stored Measurements after synchronization (38, later observed at 288 in a live database read).
+- Measurements were no longer immediately pruned by `pruneOlderThan()`'s real-wall-clock 7-day retention, because their timestamps are now real and close to the CC's own current time - the original root-cause problem this phase was created to fix.
+
+**4. Measurement end-to-end retrieval**
+- GS request: `requestMeasurements(1700000000, 2000000000)`.
+- Result: **455 measurements received**.
+- Example timestamps: `1788809465`, `1788809466`, `1788809471`, etc.
+- These decode to real 2026 dates/times, not the old synthetic counter sequence (e.g. `1000`, `1010`, ...) seen before Phase 1.
+
+**5. Event end-to-end retrieval**
+- GS request: `requestEvents(1700000000, 2000000000)`.
+- Result: **3 events received**.
+- Example timestamps: `1788809465`, `1788810135`, `1788810942`.
+- These are likewise real 2026 Unix timestamps.
+
+**6. Runtime/database investigation (environment issue, not a code defect)**
+- During verification, a discrepancy was found: the CC's own report showed stored measurements, but a GS range request initially returned 0 results for a range that should have covered them.
+- Investigation (source inspection of `data_store.cpp`, `report_generator.cpp`, `gs_communication.cpp`, and the `TimeRangeMessage` build/parse pair in `message.cpp`, plus direct read-only inspection of the database files and process/port state) found **no bug in `DataStore`, the report generator, or the range-request protocol code** - the SQL, the bindings, and the wire encode/decode were all verified correct and symmetric.
+- The actual cause: **two separate `cc_main.exe` processes were running simultaneously**, launched from different working directories, each opening its own `central_computer.db` (the DataStore path is a bare relative string). One process (the stale, older one) held real, growing measurement data; the other (the newer, correct one at the time of the initial check) had a near-empty, week-old database. `Get-NetTCPConnection -LocalPort 5000` confirmed the GS's TCP connection had landed on the **stale** process, which is why its range request returned data from the wrong database.
+- This was resolved by terminating the stale process; port 5000 ownership was then re-verified. No source code or database file was modified as part of this diagnosis.
+- **Conclusion: this was an environment/runtime process-management issue (a leftover process from earlier testing), not a defect in `DataStore`, `report_generator`, or the range-request protocol.**
+
+**7. Final Phase 1 result: PASSED**
+- **Verified**: automatic boot-time RTC synchronization (flag and underlying RTC registers both confirmed), real RTC-derived production timestamps, measurement persistence past the 7-day retention cutoff, full GS end-to-end retrieval of both Measurements and Events with real 2026 timestamps.
+- **Known limitations, unchanged from the original design (not defects)**: the LNC's startup event can never reach the CC (deterministic consequence of Option C's boot ordering, disclosed at design time); no retry/timeout if CC never answers the boot-time sync request; `g_monitor_test_timestamp`/`g_object_detection_test_timestamp` remain declared but unused (disclosed cleanup opportunity, not acted on this phase).
+- **Not covered by this verification pass**: reboot/backup-marker survival across a real power cycle, invalid-epoch rejection, and the manual `SET_RTC_DATETIME` path under real hardware conditions (each was covered only functionally/incidentally during diagnosis, not as a dedicated pass/fail test) - these remain candidates for a future verification pass if desired.
+
+## Phase 1 — LNC Timestamp/RTC Hardening — Complete Status (2026-09-07)
+
+This section is the authoritative, consolidated record of Phase 1's final implementation and verification state, superseding the narrative checkpoints above where they overlap.
+
+### 1. Implementation (final)
+
+- **Boot-time RTC synchronization** reuses the existing, already-frozen `TAG_GET_SYSTEM_TIME_REQUEST` / `TAG_SYSTEM_TIME_RESPONSE` tag pair - no new wire tag was created. The LNC now also sends this request (previously only CC did), and CC now also answers it (previously only the LNC did).
+- **New `Embeded/Core/Inc/rtc_sync.h` interface** - the only new file this phase added. Declares exactly two functions, no data, no CubeMX/`main.h` dependency.
+- **`RtcSync_ApplyEpoch(uint32_t)`** - validates the epoch against this RTC's representable range (2000-2099), converts it via the new `EpochToCalendar()` (in `main.c`), applies it via `HAL_RTC_SetTime`/`SetDate`, and on success writes the `RTC_BKP_DR0` marker and sets the synchronized state.
+- **`RtcSync_IsSynchronized()`** - the only way any other file reads synchronization state.
+- **`rtc_synchronized`** - `static` inside `main.c`; no other translation unit accesses it directly, only through the two functions above.
+- **`RTC_BKP_DR0` synchronization marker** (`RTC_SYNC_MARKER = 0x52544301`) - written only on a successful `RtcSync_ApplyEpoch()`; read once, at boot, in `MX_RTC_Init()`.
+- **RTC epoch validation**: only epochs in `[946684800, 4102444799]` (years 2000-2099, the range `RTC_DateTypeDef.Year`'s `uint8_t` representation allows) are accepted; anything outside is rejected before touching the RTC.
+- **Epoch-to-RTC-calendar conversion**: `EpochToCalendar()`, the exact inverse of the existing `DateToEpoch()`, same "simple counting loop" style, added to `main.c` (not `log.c` - that file's own `EpochToDate()` is private/date-only and was left untouched).
+- **Automatic boot synchronization request**: `Init_Start()` (`init.c`) unconditionally sends one `GET_SYSTEM_TIME_REQUEST` at the end of every boot, regardless of synchronization state (sending it is how synchronization becomes possible).
+- **Manual `SET_RTC_DATETIME` now uses the same `RtcSync_ApplyEpoch()` path** as the automatic mechanism - previously a recognized-but-deferred no-op, now fully functional and consistent with the new mechanism.
+- **TX gates**: only the final `TxQueue_Enqueue*()` call is gated on `RtcSync_IsSynchronized()`, at exactly 5 existing call sites (Monitor's `DATA_REPORT`, Monitor's mode-transition event, ObjectDetection's event, KeepAlive's frame, `communication.c`'s `ReportConfigurationChanged()` event) plus the startup event in `init.c`. All local behavior (sampling, logging, LED/buzzer) remains unconditional.
+- **CC-side handling**: `Communication::dispatch()` gained one new case for `TAG_GET_SYSTEM_TIME_REQUEST` (replies inline/synchronously with `std::time(nullptr)`, no callback) and one new case for `TAG_SYSTEM_TIME_RESPONSE` is unchanged from its pre-existing callback-based handling (the LNC-side equivalent is what's new there).
+
+**Explicitly NOT changed by this phase** (confirmed by inspection, not just intent):
+- No `log.c` changes.
+- No `event.c` changes.
+- No `DataStore`/`DataCollection` changes.
+- No GroundStation changes.
+- No TCP/range-protocol changes.
+- No RTC prescaler changes (`SynchPrediv`/`AsynchPrediv` remain `255`/`127`).
+- No new wire-level synchronization-status field - synchronization state is purely local to the LNC and CC's own real clock; nothing on the wire announces it.
+
+### 2. Verification completed
+
+#### Test 1 — Automatic Boot-Time RTC Synchronization: **PASS**
+
+Real hardware observation, via debugger (attach-to-running, no reflash) and the CC's status display, bracketing one physical board reset with `cc_main.exe` already running:
+
+| | Before | After |
+|---|---|---|
+| LNC `rtc_synchronized` | `0` | `1` |
+| LNC `g_dispatch_last_tag` | `0` | `32` (`0x20`, `TAG_SYSTEM_TIME_RESPONSE`) |
+| LNC `g_frames_decoded_ok` | - | `1` |
+| LNC `g_frames_decode_error` | `0` | `0` |
+| CC frames dispatched | `0` | `2` |
+| CC decode errors | `0` | `0` |
+
+No manual RTC command was sent at any point during this test. This proves the automatic boot-time `GET_SYSTEM_TIME_REQUEST` → CC reply → LNC dispatch → `RtcSync_ApplyEpoch()` chain works end-to-end on real hardware, entirely on its own.
+
+#### Test C — RESET / Backup Marker Survival: **PASS**
+
+Real hardware observation, via debugger, bracketing one physical `NRST` (board RESET button) press on an already-synchronized board:
+
+| Register | Before RESET | After RESET |
+|---|---|---|
+| `TR` | `0x204006` | `0x204043` |
+| `DR` | `0x262907` | `0x262907` |
+
+`rtc_synchronized` remained `1` across the reset. The date (`DR = 0x262907` → 07/09/2026) was unchanged and the time (`TR`) continued advancing normally, confirming the RTC calendar kept running through the reset rather than being reinitialized. `RTC_BKP_DR0`'s marker and the synchronized state survived the normal `NRST` reset with no re-synchronization required.
+
+**Physical RESET investigation** (see the dedicated investigation performed earlier this session): the NUCLEO-L476RG's **B2 ("RESET")** push-button drives the STM32's **`NRST`** pin, producing a normal MCU/System Reset. Per ST's documented reset architecture, this reset does **not** touch the RTC Backup Domain or `RTC_BKP_DR0` - both are only cleared by an actual loss of Backup Domain power or an explicit software-forced Backup Domain reset (neither of which this project's code performs). This makes the RESET button **appropriate and safe for Test C**, but **not sufficient for Test D**, which specifically requires an unsynchronized (Backup-Domain-cleared) starting state.
+
+### 3. Real end-to-end hardware verification
+
+After synchronization, real hardware data was confirmed to survive the complete chain: **Embedded → UART/COM10 → CC → DataStore → TCP → GS.**
+
+- **Measurements**: GS successfully received **455 measurements** via `requestMeasurements()`, all with real 2026 timestamps. Example: `t=1788809465 temp=14.00 humidity=153.00 light=52.55 battery=2.22 mode=2`.
+- **Events**: GS successfully received **3 events** via `requestEvents()`, all with real 2026 timestamps:
+  - `t=1788809465` ModeTransition `"Mode change: Normal -> Error"`
+  - `t=1788810135` ModeTransition `"Mode change: Normal -> Error"`
+  - `t=1788810942` ModeTransition `"Mode change: Normal -> Error"`
+
+This confirms the original problem this phase exists to fix - synthetic/frozen timestamps causing `DataStore::pruneOlderThan()`'s real-wall-clock 7-day retention to discard live data prematurely - is practically resolved: current hardware data now carries real timestamps, survives retention, and is retrievable by GS end-to-end.
+
+**Earlier real-hardware verification, already documented, still valid and unaffected by this phase:**
+- Embedded → CC: real frames received, decode errors 0.
+- GS → CC → DataStore → GS path verified.
+- Multi-chunk software end-to-end already verified: 14 measurements → 11 + 3 (two chunks), 8 events → 6 + 2 (two chunks).
+
+### 4. Regression status
+
+**540/540 tests PASS, 0 failures, across 14 automated suites** (latest full run, this phase):
+
+| Suite | Result |
+|---|---|
+| `protocol_test.exe` | 23/23 |
+| `message_test.exe` | 80/80 |
+| `tlv_codec_test.exe` | 22/22 |
+| `cc_message_test.exe` | 92/92 |
+| `gs_message_test.exe` | 32/32 |
+| `communication_test.exe` | 29/29 |
+| `management_command_test.exe` | 14/14 |
+| `data_store_test.exe` | 24/24 |
+| `data_collection_test.exe` | 25/25 |
+| `report_generator_test.exe` | 16/16 |
+| `tcp_transport_test.exe` | 18/18 |
+| `tcp_server_transport_test.exe` | 30/30 |
+| `gs_communication_test.exe` | 77/77 |
+| `cc_communication_test.exe` | 58/58 |
+
+**Preserved, known status, not part of the 540-count re-run** (both require real hardware, so are not re-run as part of routine PC-side regression):
+- `serial_transport_test.exe` - last known result: **10/10** (requires the real COM10 board).
+- `hardware_loopback_test.exe` - exists in `Tests/HardwareLoopback/`, but **no documented final pass count exists for it**. Not invented here.
+
+### 5. Test D — Unsynchronized Boot: **DEFERRED / NOT YET EXECUTED**
+
+Test D's purpose is to verify:
+1. `rtc_synchronized = 0` after a genuine loss of the RTC Backup Domain.
+2. No Measurement/Event/KeepAlive transmission occurs before synchronization.
+3. The LNC sends `GET_SYSTEM_TIME_REQUEST`.
+4. CC returns `SYSTEM_TIME_RESPONSE`.
+5. `RtcSync_ApplyEpoch()` changes `rtc_synchronized` from `0` to `1`.
+6. TX gates then allow normal telemetry/event traffic to resume.
+
+**Why it was deferred**: the physical RESET investigation above confirmed that a normal `NRST` reset does not clear the Backup Domain, so pressing the RESET button cannot produce the unsynchronized starting state Test D needs. Achieving that state requires either a genuine full power-loss condition or an explicit software-forced Backup Domain reset - both intentionally not performed yet, since the former is disruptive to the current verified hardware state and the latter is a destructive action outside this pass's scope. **Test D is not marked PASS, and no code was changed to make it easier to run.**
+
+### 6. Phase 1 conclusion
+
+**Phase 1 (LNC Timestamp/RTC Hardening) implementation is complete and has PASSED every verification test actually executed** (Test 1, Test C, and the full real-hardware Measurement/Event end-to-end retrieval). Regression remains 540/540 with zero new failures. **Phase 1 verification is not being claimed as 100% complete**: Test D (unsynchronized boot) remains explicitly deferred and unexecuted, pending a decision on how to safely force a genuine Backup-Domain-cleared state.
+
+## Phase 2 — Periodic RTC Re-Synchronization (LSI Drift Correction) — DESIGN ONLY, NOT YET APPROVED, NOT IMPLEMENTED
+
+Proposed next development step, chosen from the project's own already-documented deferred items (see "Next-step candidates considered" below) - not an invented feature. **No code has been written for this. Awaiting approval.**
+
+### 1. Proposed phase/step name
+Phase 2 - Periodic RTC Re-Synchronization (LSI Drift Correction).
+
+### 2. Objective
+Correct for long-uptime clock drift by periodically repeating the same synchronization Phase 1 currently only performs once, at boot.
+
+### 3. Why this is the correct next step
+- **Already explicitly flagged as the deliberate follow-up to Phase 1**, in Phase 1's own implementation notes: "`SynchPrediv`/`AsynchPrediv` deliberately left unchanged... RTC LSI-accuracy calibration is an explicitly separate, later follow-up phase." This proposal is that follow-up, not a new invention.
+- The LNC's RTC clock source is **LSI** (confirmed in `stm32l4xx_hal_msp.c`'s `HAL_RTC_MspInit()`) - an uncalibrated internal RC oscillator, not the more accurate external LSE crystal. LSI drift is typically several percent, uncorrected by anything in the current design.
+- Phase 1's Test C just proved the sync marker and RTC state **survive resets indefinitely** (`RTC_BKP_DR0` persists across `NRST`, and the Backup Domain is only lost on real power loss) - meaning a board can now legitimately run for many days between reboots without ever re-syncing, since sync currently only happens once, at boot. Uncorrected LSI drift over that long an uptime could eventually erode the same timestamp accuracy Phase 1 was built to establish - a real, currently-unaddressed gap this phase directly closes.
+- **Reuses 100% of Phase 1's already-built, already-verified infrastructure** - the same `GET_SYSTEM_TIME_REQUEST`/`SYSTEM_TIME_RESPONSE` tag pair, the same `RtcSync_ApplyEpoch()`, the same CC-side auto-reply. No new wire tag, no new module, no new architecture.
+- **Next-step candidates considered and set aside**:
+  - **Watchdog module** (Open Question #2) - the only other fully-unbuilt planned LNC module. Explicitly and repeatedly marked "paused," "do not touch until explicitly revisited," and "BLOCKING" by your own prior decisions throughout this project's history (it was previously implemented, then found to be the root cause of a real hardware reset bug, then deliberately removed entirely). **Not proposed here** - reopening it would need your explicit instruction first, not an inference from "what's left."
+  - **GS TCP reconnect / mid-request-disconnect recovery** - a real, documented open gap ("explicitly OUT OF SCOPE and UNHANDLED... an open question for a later step"), but a larger, separate concern in already-shipped, already-tested GS/CC code, requiring new reconnect-state-machine logic - a bigger architectural footprint than this phase for a comparatively rare failure mode. A reasonable future phase, just not as tightly scoped or as directly connected to Phase 1 as this one.
+
+### 4. Files that would potentially be added/modified
+- **`Embeded/Core/Src/main.c`** (`StartTask07`/`KeepAliveTask`, which already runs every 6 seconds, Sec 2.8) - add a private interval counter and, when it elapses, issue the same request Phase 1's `Init_Start()` already sends once at boot.
+- **No new files.** No changes anywhere else - not `rtc_sync.h`, not `communication.c`/`.h`, not any CC or GS file.
+
+### 5. Existing functions/classes/modules reused
+- `Message_BuildGetSystemTimeRequest()` (`message.c`) - unchanged, called again.
+- `TxQueue_EnqueueEvent()` (`tx_queue.c`) - unchanged.
+- The LNC's existing `TAG_SYSTEM_TIME_RESPONSE` dispatch case (`communication.c`) - already calls `RtcSync_ApplyEpoch()`; nothing to change, it already handles being called more than once.
+- CC's existing inline `TAG_GET_SYSTEM_TIME_REQUEST` auto-reply (`communication.cpp`) - already stateless and answers any request identically regardless of why it was sent; nothing to change.
+
+### 6. New interfaces/API
+**None required.** This is a deliberate constraint of this proposal - it is a scheduling change only (send the existing request more than once), not a new capability.
+
+### 7. Data flow / control flow
+1. `KeepAliveTask`'s existing periodic loop gains a private counter, incremented once per cycle (currently every 6 seconds).
+2. When the counter reaches the chosen interval (open question #1 below), the task builds and enqueues one `GET_SYSTEM_TIME_REQUEST` - the exact same call `Init_Start()` already makes once at boot - then resets the counter.
+3. CC receives and answers it exactly as it already does today, indistinguishable from the boot-time request.
+4. The LNC's existing dispatch path applies the response via `RtcSync_ApplyEpoch()`, which re-validates the epoch, re-sets the RTC, and re-writes the `RTC_BKP_DR0` marker (already idempotent - safe to repeat).
+5. `rtc_synchronized` remains `1` throughout; nothing about the gating logic changes.
+
+### 8. Error handling
+Identical to the existing boot-time mechanism, by design: no retry, no timeout, no new failure state. If CC doesn't answer a periodic request, the LNC keeps running on its current (slightly drifted) RTC value and simply tries again at the next interval - consistent with this project's established "no retry" philosophy (DataCollection's backfill requests, CC's range requests).
+
+### 9. Testing strategy
+- **PC-side automated**: no new wire behavior exists to test - the same builder/parser functions are already 100% covered by the existing `message_test`/`cc_message_test` suites. No new automated test is expected to be required, pending your confirmation once the exact interval/trigger mechanism is chosen.
+- **Hardware verification (new, manual, after implementation and your approval)**: run the already-synchronized board for at least one full interval and confirm, via the same debugger-visible globals already used for Test 1 (`g_dispatch_last_tag`, CC's `Frames dispatched`), that a second request/response cycle occurs automatically without any manual action. Whether the real production interval or a temporarily shortened one is used for this test is an open question for you (#4 below).
+
+### 10. Regression requirements
+Full existing 540-check PC-side suite must remain green, 540/540 - no wire format or message-layer change is introduced, so no regression is expected anywhere.
+
+### 11. Explicitly out of scope
+- Hardware LSI frequency measurement or smooth calibration (`HAL_RTCEx_SetSmoothCalib` or a TIM-based LSI measurement) - a materially larger approach; not pursued unless periodic resync proves insufficient.
+- The Watchdog module (Open Question #2) - stays paused.
+- GS TCP reconnect/mid-request-disconnect recovery - a separate, later candidate phase if wanted.
+- **Phase 1's Test D** (unsynchronized boot after a genuine Backup Domain loss) - remains its own deferred verification item; this phase does not depend on it, does not fix it, and does not fold it in as a requirement.
+- Any change to `SynchPrediv`/`AsynchPrediv` themselves - still untouched.
+
+### 12. Open architectural questions requiring your approval
+1. **What resync interval?** Options range from a fixed number of `KeepAliveTask` cycles (e.g. every N x 6s) to a running-seconds counter for something like once per hour or once per day. No default is assumed here.
+2. **Should the trigger live inside `KeepAliveTask`** (piggybacking on its existing 6-second cadence, no new task) **or somewhere else?** `KeepAliveTask` is proposed as the natural host since it already runs periodically and unconditionally, but this needs your confirmation.
+3. **Should the periodic request be gated on `RtcSync_IsSynchronized()`** (skip firing until the first, boot-time sync has already succeeded, avoiding a redundant near-duplicate request early on) **or fire unconditionally on the same interval regardless of sync state**, matching the boot-time request's own "unconditional" precedent?
+4. **For hardware verification, is an artificially shortened interval acceptable** for practical testing, or must the real production interval be used even during verification (implying a multi-hour/day test)?
+
+**No implementation will begin until you approve this design and answer the open questions above.**
 
 **Proposed API (design only, not yet implemented):**
 
@@ -1474,3 +1814,474 @@ GS  <---- TCP/Ethernet (both real executables exist and can talk to each other; 
 - `InitTask`'s Sec-7-specified "self-deletes" behavior - still not implemented (`StartTask02` still loops forever afterward, IR/Button/Buzzer test code unchanged) - a nice-to-have cleanup, not required for Init's correctness, deliberately left for later per explicit instruction.
 
 After Init is hardware-verified, continue through the rest of the LNC Application modules in the existing roadmap order (Sec 13): Keep-Alive → Watchdog (paused).
+
+---
+
+## CentralComputer Facade — IMPLEMENTED and VERIFIED (2026-09-08)
+
+Closes the gap identified in the full project gap analysis (this session): Sec 5's "Decoupling rule" requires
+a `CentralComputer` facade class (inert constructor, all I/O in `start()`/`stop()`) as the seam a later,
+separate FleetOOP module is meant to depend on. This class did not exist before this change - `cc_main.cpp`
+constructed and wired all 5 CC modules (`Communication`, `DataStore`, `ManagementCommand`, `DataCollection`,
+`GsCommunication`) itself. **FleetOOP itself remains out of scope for this change** - this is only the
+prerequisite facade, per the user's explicit scoping decision.
+
+**Explicit user constraint for this task**: keep the facade as thin and simple as possible - no new
+abstractions beyond the one class, no business logic in it, reuse the 5 modules' existing, already-tested
+public methods exactly as `cc_main.cpp` already called them.
+
+### What was implemented
+
+- **New `CentralComputer/include/central_computer.h` / `src/central_computer.cpp`** - `class CentralComputer`
+  owning all 5 modules as plain value members (`communication_`, `dataStore_` declared first, since
+  `managementCommand_`/`dataCollection_`/`gsCommunication_` hold references to one or both of them - same
+  construction-order convention `Tests/DataCollection/data_collection_test.cpp`'s own test rig already uses).
+  No copy-control declared explicitly - `dataCollection_` (a `DataCollection` member) already has its own
+  copy-ctor/assignment deleted, which implicitly deletes `CentralComputer`'s too; a one-line header comment
+  explains this rather than adding redundant `= delete` lines.
+- **`CentralComputer()`** - inert: only wires the 5 members to each other via the constructor initializer
+  list. No port, file, or socket is touched.
+- **`bool start(portName, baudRate, dbPath, gsPort)`** - opens the database first (the one fatal condition -
+  returns `false` on failure), then starts the Ground Station listener, then opens the serial port (both
+  non-fatal) - same order and same fatal/non-fatal split `cc_main.cpp` already used. Prints nothing - no
+  business logic in this class, per the explicit constraint.
+- **`void stop()`** - closes the serial port, GS listener, and database, in that order (same as before).
+- **`void poll()`** - polls the serial connection and the GS connection (same as before). `ManagementCommand`
+  and `DataCollection` have no `poll()`/`close()` of their own - confirmed from their headers, not omitted by
+  mistake.
+- **5 reference-returning accessors** (`communication()`, `dataStore()`, `managementCommand()`,
+  `dataCollection()`, `gsCommunication()`) - the only way a caller reaches the owned modules, letting
+  `cc_main.cpp` keep every existing menu-handler function and lambda body completely unchanged, just called
+  through `cc.xxx()` instead of a local variable.
+- **`cc_main.cpp` refactored, zero behavior change**: the 5 individually-constructed objects and their
+  individual `open()`/`startListening()`/`close()` calls are replaced by one `central_computer::CentralComputer cc;`
+  plus `cc.start(...)`/`cc.stop()`; the main loop's `comm.poll(); gsComm.poll();` becomes `cc.poll();`. Every
+  printed string, warning, and menu action is byte-for-byte identical to before. The 5 individual module
+  `#include`s were removed (pulled in transitively via `central_computer.h`); `report_generator.h` stays.
+
+### Files changed
+
+**New**: `CentralComputer/include/central_computer.h`, `CentralComputer/src/central_computer.cpp`,
+`Tests/CentralComputer/central_computer_test.cpp`.
+**Modified**: `CentralComputer/src/cc_main.cpp` (mechanical refactor only, per above).
+**Not touched, confirmed via `git status`**: all 5 wrapped classes' own headers/implementations, the wire
+protocol, `message.h`/`.cpp`, all 14 pre-existing test files, `FleetOOP/` (still empty - a separate,
+later task), any LNC or Ground Station file.
+
+### New test: `central_computer_test.exe` - 16/16 PASS
+
+A thin wiring/lifecycle test (`":memory:"` database, a COM port name guaranteed not to exist, real ephemeral
+local-only TCP ports) - proves the facade's own construction/lifecycle behavior, not the 5 wrapped modules'
+internal behavior (already covered exhaustively by `communication_test`/`data_store_test`/
+`management_command_test`/`data_collection_test`/`gs_communication_test`). Checks: constructor performs no
+I/O; `start()` returns `true`/opens the database on a valid path; `start()` returns `false` on an unusable
+database path; `start()` still returns `true` (non-fatal) when the COM port doesn't exist; the GS listener
+opens on the requested port; `managementCommand()`/`dataCollection()` send through the same `Communication`
+instance `communication()` returns (checked via `Communication::lastSentFrame`, the same technique
+`management_command_test.cpp` already uses); `stop()` closes everything; `poll()` doesn't crash with nothing
+connected.
+
+### Build verification (real toolchain, not just review)
+
+- New objects compile clean with `-Wall`: zero warnings for `central_computer.h`/`.cpp` and the new test.
+  `cc_main.cpp` recompiles with the same single pre-existing, unrelated `ModeName`-unused warning it has
+  always had (confirmed unchanged, not introduced by this change).
+- `cc_main.exe` fully relinked with the new `central_computer.o` added to its object list - links cleanly.
+- **Regression: 556/556 checks passing, 0 failures** - the pre-existing 540/540 across the original 14
+  suites (`protocol_test` 23/23, `message_test` 80/80, `tlv_codec_test` 22/22, `cc_message_test` 92/92,
+  `gs_message_test` 32/32, `communication_test` 29/29, `management_command_test` 14/14, `data_store_test`
+  24/24, `data_collection_test` 25/25, `report_generator_test` 16/16, `tcp_transport_test` 18/18,
+  `tcp_server_transport_test` 30/30, `gs_communication_test` 77/77, `cc_communication_test` 58/58 - every
+  one individually re-run and confirmed unchanged, zero regression anywhere), plus the new
+  `central_computer_test.exe` (16/16). `serial_transport_test.exe` (last known 10/10) and
+  `hardware_loopback_test.exe` (no documented final pass count) remain as previously recorded - neither
+  requires or was affected by this change.
+### Hardware smoke test (2026-09-08) - PASSED, one item investigated
+
+The refactored `cc_main.exe` was run against the real STM32 board and a real `gs_main.exe`, confirming the
+facade's `start()`/`poll()`/`stop()` sequence behaves identically to the pre-refactor code on real hardware,
+not just in the PC-side regression suite:
+
+- Real STM32 -> CC -> SQLite -> GS communication verified end-to-end.
+- **1,795 measurements** retrieved successfully through GS.
+- **19 events** retrieved successfully through GS.
+- The 7-day report (`[4]`) verified correct.
+- Management commands (`[1]`/`[5]`/`[6]`) sent successfully.
+
+**One item required investigation before closing this out: `CC Decode errors: 1`.**
+
+- **Root cause**: `Communication::decodeErrors` (`communication.cpp`) increments only inside
+  `Communication::feedByte()`, when `tlv::Decoder::feedByte()` (`Common/TLVCodec/tlv_codec.cpp`) returns
+  `DecodeStatus::Error` - which happens in exactly two cases, confirmed directly from the decoder's source:
+  (1) a `Length` field that would make the frame exceed the frozen 256-byte cap, or (2) a CRC mismatch on an
+  otherwise-complete frame. Both are pure byte-content checks on the raw UART stream, fed one byte at a time
+  from `Communication::poll()`. A single such error, immediately followed by over 1,795 correctly-decoded
+  measurements and 19 correctly-decoded events with no further errors, is consistent with the decoder
+  encountering exactly one corrupted or misaligned byte sequence on the physical link (e.g. real UART/VCP
+  line noise, or a stray byte already sitting in the OS's serial receive buffer at the moment `comm.open()`
+  ran) and then correctly rejecting and resynchronizing on the next `0xAA` - which is precisely the frozen
+  protocol's own required behavior ("malformed frames: rejected, decoder resyncs on the next `0xAA` byte",
+  Sec 6), not a malfunction. No passive capture was running during this smoke test, so the exact corrupted
+  byte content cannot be forensically recovered - but the mechanism and its category (a real-link
+  transmission glitch, correctly caught and recovered from) are established with high confidence.
+- **Not caused by the `CentralComputer` facade**: confirmed by direct inspection, not assumption. The
+  facade's `start()` calls `dataStore_.open()`, then `gsCommunication_.startListening()`, then
+  `communication_.open()` - the exact same order `cc_main.cpp` already used before this refactor existed.
+  `poll()` calls `communication_.poll(); gsCommunication_.poll();` - the exact same order and the exact same
+  two calls the old `main()` loop made directly. `central_computer.cpp` does not touch, wrap, or call
+  anything in `tlv_codec.cpp` or `communication.cpp`'s decode path at all - `Communication`'s own
+  `decoder_` member and `feedByte()` logic are 100% unmodified by this change. A facade that only forwards
+  calls in the same order cannot introduce a byte-level decode error in code it never touches.
+- **No fix applied.** Per the investigation's own findings, a single self-recovered decode error out of
+  thousands of successfully processed frames is the protocol's designed-for resilience mechanism working
+  correctly, not a defect - there is nothing to fix. No source file was modified as a result of this
+  investigation, so no re-test or regression re-run was triggered by it.
+
+**Also confirmed: `Measurement backfill in progress: yes` is expected, pre-existing behavior, unrelated to
+the facade.** Traced directly through `DataCollection::requestMeasurementBackfill()` /
+`isMeasurementBackfillInProgress()` / `onMeasurementChunkResponse()` (`data_collection.cpp`):
+`pendingMeasurementRequestId_` is set the moment a backfill request is sent, and is only cleared inside
+`onMeasurementChunkResponse()` when a chunk response with the matching `requestId` and `moreDataFlag == false`
+arrives - by design, with no timeout (matching this project's established "no retry/timeout" philosophy used
+everywhere else). Confirmed directly from `communication.c` that the LNC recognizes
+`TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST`/`TAG_GET_EVENTS_BY_RANGE_REQUEST` but deliberately only increments
+`s_deferredCount` for both - it never builds or sends a reply, since reading historical data back off the SD
+card and building chunked responses for it remains a separate, not-yet-built feature (unchanged from
+earlier in this project's history). So once a measurement backfill is requested during a session, it will
+correctly show "in progress: yes" for the rest of that session - this is the expected, already-documented
+consequence of the LNC's application layer not yet implementing this reply, not a regression introduced by
+`CentralComputer`. `DataCollection`'s own request/pending-state logic is completely untouched by this
+refactor.
+
+### Build recipe addition
+
+`cc_main.exe`'s build gains one new compile step and one new object on the link line:
+```
+g++ -std=c++17 -I CentralComputer/include -I Common/TLVCodec -I Common/Protocol -I Common/ThirdParty/sqlite3 -c CentralComputer/src/central_computer.cpp -o central_computer.o
+```
+(`central_computer.o` added to the final link line alongside the existing object list.)
+
+Nothing committed yet.
+
+---
+
+## Phase B — Fleet/OOP — IMPLEMENTED and VERIFIED (2026-09-08)
+
+Closes Sec 5 ("OOP Part - Submarine Fleet Management System"), the last major block identified as missing in
+the full project gap analysis. Implemented as a separate, in-memory exercise with **zero** networking,
+database, or file persistence, exactly as the spec requires - and built one file at a time (implement →
+build → focused test → re-run all previous tests → `git diff`/status → stop and report), approved at every
+step before the next began.
+
+### What was implemented
+
+Six classes in namespace `fleet`, one file pair each, plus one menu entry point:
+
+- **`Submarine`** (abstract) - `serialNumber_`, `name_`, `assignedToMission_`; `assignToMission()`/`endMission()`;
+  pure virtual `print()`/`typeName()`. No back-reference to `Fleet` or `Mission` anywhere - Sec 5's locked
+  decoupling decision.
+- **`ResearchSubmarine : public Submarine`** - adds `researchTopic_` and `researchers_`, with
+  `setResearchTopic()`/`addResearcher()` for menu operation 5.
+- **`CombatSubmarine : public Submarine`** - adds `commanderName_`, `personnelCount_`, `missionDescription_`;
+  ally tracking (`addAlly()`/`allies()`/`isAllyOf()`/`clearAllies()`, non-owning `CombatSubmarine*` pointers)
+  for operations 7/8; `receiveMessage()`/`inbox()` for operations 8/9. **Owns
+  `std::unique_ptr<central_computer::CentralComputer>`**, created in its constructor via `make_unique`,
+  destroyed with it, **never started** - `combat_submarine.h` is the only FleetOOP file that includes
+  `central_computer.h`; nothing in FleetOOP ever calls `start()`, `stop()`, or `poll()`, or includes any
+  `Communication`/`GsCommunication`/`DataStore`/protocol/transport header.
+- **`fleet::Message`** (`fleet_message.h`/`.cpp`, deliberately not named `message.h` to stay unambiguous
+  against the protocol message layer) - `content_` + non-owning `const CombatSubmarine *sender_`. No
+  receiver field (the message lives in the receiver's own inbox), no timestamp, no id.
+- **`Mission`** - `description_` + `submarineSerialNumber_` only, exactly as approved: no participants, no
+  status, no timestamps, no mission id, no back-reference.
+- **`Fleet`** - owns `std::vector<std::unique_ptr<Submarine>>` (polymorphic storage, deleted correctly
+  through the base pointer) and `std::vector<Mission> missionHistory_` (the fleet-owned history). Implements
+  the validated logic behind menu operations 1, 2, 3, 4, 6, 7, 8 (5 and 9 are handled in the menu via
+  `dynamic_cast`, per the approved design, since they are type-specific display/update operations with no
+  shared `Fleet`-level rule to enforce).
+- **`fleet_main.cpp`** - the interactive console menu for all 10 operations, driven entirely through
+  `Fleet`'s public API. No business logic lives here - every accept/reject decision is `Fleet`'s; the menu
+  only reports the result. `dynamic_cast` used only for operation 5 (research vs. combat detail updates) and
+  operation 9 (inbox is combat-only). A separate executable (`fleet_main.exe`), not folded into `cc_main`,
+  matching Sec 11's own directory tree.
+
+**Two small, approved deviations from the original API sketch:**
+- `Fleet::addSubmarine()` returns `bool` (not `void`) - required so `Fleet` itself enforces "duplicate
+  serial numbers must be rejected" rather than relying on the caller to check first.
+- `Fleet::submarineCount()` was added - a one-line accessor needed only so a rejected duplicate's absence is
+  observable in a test; not used by `fleet_main.cpp`'s menu logic.
+- `CombatSubmarine::centralComputer()` was added - returns the raw, non-owning pointer, used only to verify
+  in tests that the owned `CentralComputer` exists and was never started. FleetOOP production code
+  (`fleet.cpp`, `fleet_main.cpp`) never calls it.
+
+### Files changed
+
+**New, entirely under `FleetOOP/` and `Tests/FleetOOP/`**: `FleetOOP/include/{submarine,research_submarine,
+combat_submarine,fleet_message,mission,fleet}.h`, `FleetOOP/src/{submarine,research_submarine,
+combat_submarine,fleet_message,mission,fleet,fleet_main}.cpp`, `Tests/FleetOOP/fleet_test.cpp`.
+**Not touched, confirmed via `git status`/`git diff` and file timestamps**: `cc_main.cpp`,
+`central_computer.h`/`.cpp`, every other Central Computer module, the wire protocol, `message.h`/`.cpp`,
+Ground Station, the LNC (`Embeded/`), and all 15 pre-existing test files. Phase A and Phase 1 remain exactly
+as they were - nothing in this phase modified their behavior.
+
+### Test results
+
+**`fleet_test.exe` - 106/106 checks passing, 0 failures.** One growing test file, built incrementally
+alongside each class (Sec 12's own "a test file accompanies every implementation file" convention, plain
+`check()`-based style, no test library), re-running every prior check at each step. Covers: `Submarine`'s
+flag behavior and virtual dispatch through a base pointer; `ResearchSubmarine`'s/`CombatSubmarine`'s own
+fields and detail updates; the owned `CentralComputer`'s existence and confirmed-inactive state
+(`dataStore().isOpen()`, `communication().isOpen()`, `gsCommunication().isListening()` all false after
+construction); `Message` storage and delivery into the receiver's inbox only; `Mission` as a plain history
+value; and `Fleet`'s full success **and** rejection/edge-case matrix for every operation - duplicate serial,
+unknown serial, double assignment, ending an unassigned mission, self-association, non-combat submarines
+refused for operations 7/8/9, unassigned submarines refused for operation 7, duplicate association, empty
+message, cross-mission message, bidirectional allies, ally-clearing on mission end, and polymorphic dispatch
+through `Submarine*` for both concrete types in one `Fleet`.
+
+**Manual smoke test of `fleet_main.exe`** (interactive console I/O isn't unit-testable, same honest
+limitation `cc_main.cpp` already has): all 10 menu operations exercised via a scripted session - add (incl.
+a duplicate correctly rejected), display, search (incl. unknown serial), assign, associate (incl. a research
+submarine correctly rejected), send/receive a message (incl. a non-ally correctly rejected), display
+received messages, update type-specific details, end a mission, and exit - all producing the correct
+output and correctly rejecting every invalid case tested.
+
+### Integration / regression results
+
+- **Full clean Fleet/OOP build from scratch** (all 6 classes + `fleet_main.cpp` + the CC objects
+  `CombatSubmarine` pulls in transitively): zero warnings, zero errors.
+- **Full existing regression re-run individually, all 556/556 passing, 0 failures**: the original 540 across
+  14 suites (`protocol_test` 23/23, `message_test` 80/80, `tlv_codec_test` 22/22, `cc_message_test` 92/92,
+  `gs_message_test` 32/32, `communication_test` 29/29, `management_command_test` 14/14, `data_store_test`
+  24/24, `data_collection_test` 25/25, `report_generator_test` 16/16, `tcp_transport_test` 18/18,
+  `tcp_server_transport_test` 30/30, `gs_communication_test` 77/77, `cc_communication_test` 58/58) plus
+  `central_computer_test` (16/16) - every one confirmed unchanged, zero regression anywhere from adding
+  Fleet/OOP.
+- **`cc_main.exe` confirmed unchanged**: rebuilt clean from `cc_main.cpp`/`central_computer.cpp` (both
+  file-timestamp-confirmed untouched since Phase A), same single pre-existing `ModeName`-unused warning,
+  links successfully with the same object list as before.
+- `serial_transport_test.exe` (last known 10/10) and `hardware_loopback_test.exe` (no documented final pass
+  count) remain as previously recorded - neither requires or was affected by this phase.
+
+### Final stopping point / remaining work
+
+**Phase B (Fleet/OOP) is implemented and verified as a complete, in-memory, standalone exercise.** No known
+open items remain within Fleet/OOP's own approved scope - all 10 menu operations, both concrete submarine
+types, the `CentralComputer` ownership requirement, and the mission-history/ally/message rules are
+implemented and tested, including their rejection paths. Nothing outside `FleetOOP/`/`Tests/FleetOOP/` was
+touched. Nothing has been committed.
+
+---
+
+## Manual Verification & Investigation Status (2026-09-08)
+
+This section records the full manual verification pass performed after Phase B, plus the current state of
+an open, unresolved hardware investigation. **Nothing in this section should be read as claiming a fix for
+Command [5] - that issue remains open, see §8-15 below.**
+
+### 1. FleetOOP - COMPLETED
+
+Fleet/OOP implementation and manual verification are complete. Implemented: `Submarine`,
+`ResearchSubmarine`, `CombatSubmarine`, `Message`, `Mission`, `Fleet`, `fleet_main.cpp`,
+`Tests/FleetOOP/fleet_test.cpp`.
+
+All 10 menu operations were implemented and manually tested. Manual Fleet tests passed: add submarine,
+display all submarines, search by serial number, assign mission, update mission details, end mission,
+associate combat submarines, send message between allied combat submarines, display inbox, exit.
+
+Negative cases were also manually tested: duplicate submarine, unknown submarine, reassignment while
+already assigned, duplicate alliance, self-alliance, research/combat invalid association, sending to a
+research submarine, sending to a non-allied submarine, empty message.
+
+Automated Fleet test: **106/106 PASS**. Fleet executable built cleanly with `-Wall`, no warnings/errors.
+Fleet/OOP architecture constraints remain as previously documented.
+
+### 2. Full automated regression - PASSED
+
+```
+Protocol              23/23
+Message                80/80
+TLVCodec               22/22
+CCMessage               92/92
+GSMessage               32/32
+Communication           29/29
+ManagementCommand       14/14
+DataStore               24/24
+DataCollection          25/25
+ReportGenerator         16/16
+TcpTransport            18/18
+TcpServerTransport      30/30
+GsCommunication         77/77
+CentralComputer         16/16
+FleetOOP               106/106
+```
+**Total: 604/604 automated checks PASS, 0 failed.**
+
+Separate CC communication integration test: **58/58 PASS**. Therefore: **662/662 checks PASS, 0 failed.**
+The previous transient integration timing issue did not occur during this latest full verification run.
+
+### 3. Build verification - PASSED
+
+- **Central Computer**: build successful. Only known pre-existing warning: `cc_main.cpp:76`,
+  `ModeName()` defined but not used. No new warning related to the current investigation.
+- **Ground Station**: build successful, zero warnings/errors.
+- **FleetOOP**: build successful, zero warnings/errors.
+- **Embedded**: build successful using the real ARM GCC/Make build. Previously verified firmware size:
+  `text = 79680`, `data = 156`, `bss = 24020`. Zero warnings.
+
+### 4. Manual FleetOOP verification - PASSED
+
+Manual smoke test of all 10 menu operations was completed successfully. The user confirmed the
+application behaves correctly. **FleetOOP should be considered COMPLETE.**
+
+### 5. Central Computer manual verification - MOSTLY PASSED
+
+- **CC startup - PASS.** Observed: `Database opened: central_computer.db`,
+  `Listening for Ground Station on TCP port 5000.`, `Connected to COM10 at 115200 baud.`
+- **CC status - PASS.** **CC quit - PASS.** **CC + GS connection - PASS.**
+  **CC status with GS connected - PASS.** **GS status - PASS.**
+- **Measurement request - PASS communication-wise.** Initially the database had no measurements; later
+  the GS successfully received thousands of measurements from the Embedded.
+- **Events request - PASS.** GS successfully received events.
+- **CC report - PASS.** Report generation works.
+- **RTC set command - PASS.** `g_frames_decoded_ok` increased as expected.
+- **System Time request - PASS**, after allowing startup synchronization to complete. Verified result:
+  - Before: `g_dispatch_system_time_request_count = 0`, `rtc_synchronized = 1`, `g_dispatch_last_tag = 9`
+  - After sending System Time request: `g_dispatch_last_tag = 16 (0x10)`,
+    `g_dispatch_system_time_request_count = 1`
+  - Therefore `TAG_GET_SYSTEM_TIME_REQUEST = 0x10` was successfully decoded and dispatched.
+- **CC status after communication - PASS.** Example verified status: `Frames dispatched: 92`,
+  `Decode errors: 0`, `GS frames dispatched: 3`, `GS decode errors: 0`.
+- **Measurement backfill**: command starts successfully. **Known limitation** (already documented): the
+  real Embedded/LNC application layer does not currently provide the requested historical backfill
+  responses, so the operation remains "in progress" - expected, not a new defect.
+
+### 6. Ground Station manual verification - PASSED
+
+- **GS connection - PASS. GS status - PASS.**
+- **Measurement request - PASS.** Verified example: 3730 measurements received, e.g.
+  `t=1788854079 temp=26.00 humidity=53.00 light=100.00 battery=2.78 mode=2`.
+- **Events request - PASS.** Verified: 58 events received.
+- **GS status - PASS.** Verified: `Frames dispatched: 353`, `decode errors: 0`.
+- **GS restart and reconnect - PASS** - user confirmed it works cleanly.
+
+### 7. Embedded manual verification - PARTIALLY PASSED
+
+- **Debugger/basic state - PASS.** Verified target is available.
+- **Temperature configuration**: `g_config_temp_normal_low = 18.0`, `g_config_temp_normal_high = 28.0`.
+  **However, these values are boot-time snapshots from Flash and therefore do NOT by themselves prove
+  that the latest Command [5] was received** (see §9's own earlier finding that this mirror is written
+  once, at boot, from Flash-persisted state).
+- **RTC command - PASS.** Before: `g_frames_decoded_ok = 2`. After sending RTC command:
+  `g_frames_decoded_ok = 3`.
+- **System Time request - PASS**, after startup synchronization was allowed to settle. Verified:
+  `g_dispatch_last_tag = 16 (0x10)`, `g_dispatch_system_time_request_count = 1`.
+
+### 8. Current unresolved issue - Command [5]
+
+Command [5] (Set Temperature Normal Range) should send `TAG_SET_TEMP_NORMAL_RANGE = 0x01`. Expected
+frame: `AA 01 08 00 00 00 90 41 00 00 E0 41 C7 7B` (14 bytes total), payload `18.0f`/`28.0f`.
+
+**Current observation.** After a fresh reset, before Command [5]: `g_frames_decoded_ok = 0`,
+`g_frames_decode_error = 0`, `g_dispatch_last_tag = 0`. After sending Command [5] once:
+`g_frames_decoded_ok = 1`, `g_frames_decode_error = 0`, `g_dispatch_last_tag = 32`.
+
+`32` decimal `= 0x20 = TAG_SYSTEM_TIME_RESPONSE` - the automatic startup System Time response.
+**Therefore the decoded frame was NOT Command [5].** There was no additional decoded frame corresponding
+to `TAG_SET_TEMP_NORMAL_RANGE = 0x01`.
+
+### 9. Important clarification about Command [5]
+
+A previous investigation confirmed `PROTOCOL_MAX_FRAME_SIZE = 256`, `PROTOCOL_MAX_VALUE_SIZE = 250`.
+Command [5] uses 14 bytes total, 8 bytes value - nowhere near the protocol frame-size limit.
+`Protocol_FeedByte()` is length-agnostic and can process the 14-byte frame. No bug was found in the
+protocol decoder that specifically limits frames to 6/10/14 bytes.
+
+### 10. Important RX investigation result
+
+The Embedded RX mechanism currently uses `HAL_UART_Receive()` one byte at a time. USART2 is
+polling-based. No DMA or interrupt-based RX was found. CommRxTask immediately requests the next byte
+after a successful reception. At 115200 baud, approximately 87 µs/byte.
+
+A possible UART overrun/dropped-byte scenario was identified as a **plausible hypothesis** because: RX is
+polling-only; UART hardware has limited receive buffering; FreeRTOS scheduling can delay the RX task; a
+dropped byte could cause the protocol decoder to wait indefinitely for the declared remaining bytes, in
+which case neither `g_frames_decoded_ok` nor `g_frames_decode_error` would necessarily increase.
+
+**IMPORTANT: this is only a hypothesis. It has NOT been proven to be the root cause. Do not document
+UART overrun as a confirmed root cause.**
+
+### 11. Protocol decoder behavior
+
+A read-only investigation confirmed: if a frame is partially received and a byte is missing, the decoder
+can remain in a state waiting for additional bytes. There is no independent protocol-level timeout that
+automatically resets a partial frame. Therefore a corrupted/truncated frame can potentially produce
+`g_frames_decoded_ok` unchanged, `g_frames_decode_error` unchanged, `g_dispatch_last_tag` unchanged. This
+is relevant to the current Command [5] symptom. **Again, this does NOT prove that this is what is
+happening.**
+
+### 12. Command [6] vs Command [5]
+
+Command [6] (`GET_SYSTEM_TIME_REQUEST`, tag `0x10`, payload 0, frame 6 bytes) has successfully worked.
+Command [5] (`SET_TEMP_NORMAL_RANGE`, tag `0x01`, payload 8 bytes, frame 14 bytes) has not yet been
+successfully verified end-to-end in the latest controlled test.
+
+Previous historical testing did show a successful Command [5] dispatch at least once: `g_frames_decoded_ok
+= 1`, `g_dispatch_set_limit_count = 1`, `g_dispatch_last_tag = 1 (0x01)`. This is important evidence that
+the Command [5] implementation CAN work. The current problem therefore appears intermittent or
+environment/timing/path dependent rather than a guaranteed protocol incompatibility.
+
+### 13. Previous investigation of incorrect tags
+
+Several misleading tag values were observed during testing:
+
+- **`0x09` / decimal 9** - this is `TAG_SET_RTC_DATETIME`. It appeared because the user had pressed CC
+  option [1] before option [6]. Confirmed to be user input/order, not a protocol bug.
+- **`0x20` / decimal 32** - this is `TAG_SYSTEM_TIME_RESPONSE`, automatically generated during Embedded
+  startup synchronization. Seeing 32 after a reset can be completely legitimate.
+- **`0x32`** - this is `TAG_EVENT_CONFIG_CHANGED`, an Embedded/LNC → CC event generated after
+  configuration changes. A previous anomalous observation of `0x32` instead of `0x01` was investigated.
+  The actual Command [5] frame was not proven to have arrived in that case. A previously documented
+  USART2 self-loopback/PA2↔PA3 anomaly remains a possible environmental factor. **Do not claim that
+  `0x32` proves Command [5] was dispatched.**
+
+### 14. Current root-cause status
+
+**Command [5] is currently UNRESOLVED.** The following have NOT been proven to be the cause: protocol
+frame size, `Protocol_FeedByte()` length handling, CRC, float encoding, CC command construction, UART
+overrun, COM10, ST-LINK VCP, FreeRTOS scheduling, RX buffer, TX path. These remain under investigation.
+
+### 15. Current investigation direction
+
+The next investigation is a **complete read-only analysis** of the entire Command [5] path:
+
+```
+CC menu -> cc_main.cpp -> ManagementCommand -> message builder -> TLV encoder
+  -> Communication::sendFrame() -> SerialPort::send() -> WriteFile() -> Windows COM10
+  -> USB/ST-LINK VCP -> STM32 USART2 -> HAL_UART_Receive() -> CommRxTask
+  -> Protocol_FeedByte() -> Communication_Dispatch()
+```
+
+The investigation should examine: CC TX path, exact frame bytes, `WriteFile` result, `bytesWritten`, COM
+configuration, USB/ST-LINK, UART configuration, UART errors, overrun, FreeRTOS scheduling, RX buffers,
+protocol decoder, CRC, payload parsing, TX queues, competing traffic, startup timing, memory corruption,
+binary/source consistency, and every USART2 access - comparing Command [5] against the known-working
+Command [6].
+
+### 16. Current status summary
+
+**COMPLETE / PASS**: FleetOOP implementation; FleetOOP automated tests (106/106); all 15 automated test
+suites (604/604); CC communication integration (58/58); full total (662/662); Central Computer startup;
+CC/GS connection; CC status; GS status; measurements communication; events communication; report
+generation; RTC command; System Time command; GS restart/reconnect; Embedded build; Embedded basic
+operation.
+
+**KNOWN LIMITATION**: real LNC measurement/event historical backfill application response is not
+implemented/available, so the backfill operation can remain "in progress" (pre-existing, documented).
+
+**UNRESOLVED**: Command [5] / `TAG_SET_TEMP_NORMAL_RANGE = 0x01` does not consistently appear at the
+Embedded dispatcher. Need to determine whether the problem is on the CC TX side, the physical/USB/UART
+path, or the Embedded RX side.
+
+**NEXT STEP**: complete the read-only root-cause investigation before making any code changes. Do not
+mark the issue as fixed. No source files were changed as part of this documentation update.

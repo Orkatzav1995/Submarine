@@ -7,6 +7,7 @@
 #include "object_detection.h"
 #include "event.h"
 #include "tx_queue.h"
+#include "rtc_sync.h"
 
 /* The raw reading from the previous poll, so a change (= activity) can
  * be detected. */
@@ -61,10 +62,16 @@ void ObjectDetection_Poll(uint32_t timestamp)
 
         /* Event writes its own record, drives the LED/buzzer, and
          * returns the CC-bound frame - now enqueued at event priority
-         * (Sec 7) so CommTxTask actually sends it. */
+         * (Sec 7) so CommTxTask actually sends it. Phase 1 (LNC
+         * Timestamp/RTC Hardening): the enqueue is gated on
+         * RtcSync_IsSynchronized() - before the RTC has ever been set
+         * from a real CC-supplied epoch, this event's timestamp would be
+         * misleading if it reached DataStore, so it is simply never sent.
+         * Event_OnObjectDetection() itself (local record, LED, buzzer)
+         * and the debounce state machine above always run regardless. */
         frameLength = Event_OnObjectDetection(&detection, frame, sizeof(frame));
 
-        if (frameLength > 0)
+        if (frameLength > 0 && RtcSync_IsSynchronized())
         {
             TxQueue_EnqueueEvent(frame, frameLength);
         }

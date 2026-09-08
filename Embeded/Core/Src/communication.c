@@ -10,6 +10,7 @@
 #include "configuration.h"
 #include "event.h"
 #include "tx_queue.h"
+#include "rtc_sync.h"
 
 static uint8_t s_lastDispatchedTag = 0;
 static uint32_t s_setLimitCount = 0;
@@ -20,7 +21,14 @@ static uint32_t s_unknownTagCount = 0;
 /* Shared by all 8 "set limit" cases: reports the change to Event the way
  * Sec 2.6 requires ("Receives configuration changes from Communication"
  * -> Event writes it to the events file), then enqueues the frame Event
- * built at event priority (Sec 7) so CommTxTask sends it to the CC. */
+ * built at event priority (Sec 7) so CommTxTask sends it to the CC.
+ * Phase 1 (LNC Timestamp/RTC Hardening): the enqueue is gated on
+ * RtcSync_IsSynchronized() - before the RTC has ever been set from a real
+ * CC-supplied epoch, this event's timestamp would be misleading if it
+ * reached DataStore, so it is simply never sent. Event_OnConfigurationChanged()
+ * itself (local events-file record) always runs regardless - and the
+ * configuration change itself (Config_SetXxx(), called by each "set
+ * limit" case below before this function runs) is never gated at all. */
 static void ReportConfigurationChanged(uint32_t timestamp)
 {
     TimestampMessage change;
@@ -30,7 +38,7 @@ static void ReportConfigurationChanged(uint32_t timestamp)
     change.timestamp = timestamp;
     frameLength = Event_OnConfigurationChanged(&change, frame, sizeof(frame));
 
-    if (frameLength > 0)
+    if (frameLength > 0 && RtcSync_IsSynchronized())
     {
         TxQueue_EnqueueEvent(frame, frameLength);
     }
@@ -206,9 +214,50 @@ void Communication_Dispatch(const ProtocolFrame *frame, uint32_t timestamp)
             break;
         }
 
+        /* Phase 1 (LNC Timestamp/RTC Hardening): the existing manual
+         * CC-push synchronization mechanism - now actually applies the
+         * received epoch to the RTC, via the same shared helper the new
+         * TAG_SYSTEM_TIME_RESPONSE case below uses. Previously this tag
+         * was recognized but deliberately deferred (a no-op); it is now
+         * fully implemented, exactly as this phase's design required.
+         * On a parse or RTC-apply failure, nothing happens - the RTC and
+         * synchronization state are left exactly as they were. */
+        case TAG_SET_RTC_DATETIME:
+        {
+            TimestampMessage message;
+            if (Message_ParseSetRtcDateTime(frame, &message))
+            {
+                RtcSync_ApplyEpoch(message.timestamp);
+            }
+            else
+            {
+                s_unknownTagCount++;
+            }
+            break;
+        }
+
+        /* Phase 1 (LNC Timestamp/RTC Hardening): the new, active,
+         * LNC-initiated synchronization mechanism - CC's reply to the
+         * boot-time TAG_GET_SYSTEM_TIME_REQUEST sent from Init_Start().
+         * Uses the exact same RtcSync_ApplyEpoch() helper as the manual
+         * TAG_SET_RTC_DATETIME case above, so both mechanisms stay
+         * consistent with each other. */
+        case TAG_SYSTEM_TIME_RESPONSE:
+        {
+            TimestampMessage message;
+            if (Message_ParseSystemTimeResponse(frame, &message))
+            {
+                RtcSync_ApplyEpoch(message.timestamp);
+            }
+            else
+            {
+                s_unknownTagCount++;
+            }
+            break;
+        }
+
         /* Recognized tags, deliberately not acted on yet - see
          * communication.h's header comment for why each one is deferred. */
-        case TAG_SET_RTC_DATETIME:
         case TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST:
         case TAG_GET_EVENTS_BY_RANGE_REQUEST:
             s_deferredCount++;

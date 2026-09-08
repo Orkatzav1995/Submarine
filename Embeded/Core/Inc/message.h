@@ -113,11 +113,28 @@ uint16_t Message_BuildSystemTimeResponse(const TimestampMessage *message, uint8_
 uint16_t Message_BuildEventConfigChanged(const TimestampMessage *message, uint8_t *out_buffer, uint16_t out_buffer_size);
 
 /*
+ * Phase 1 (LNC Timestamp/RTC Hardening): CC -> LNC, in reply to the LNC's
+ * own boot-time TAG_GET_SYSTEM_TIME_REQUEST (built below) - CC's real
+ * current time. LNC receives this, so it parses, reusing the same
+ * TimestampMessage every other single-timestamp tag already shares.
+ */
+int Message_ParseSystemTimeResponse(const ProtocolFrame *frame, TimestampMessage *out_message);
+
+/*
  * CC -> LNC request with no payload at all: TAG_GET_SYSTEM_TIME_REQUEST.
  * Nothing to put in an output struct - just confirms the frame is this type.
  * Returns 1 if frame matches (right tag, zero-length payload), 0 otherwise.
  */
 int Message_ParseGetSystemTimeRequest(const ProtocolFrame *frame);
+
+/*
+ * Phase 1 (LNC Timestamp/RTC Hardening): LNC -> CC, sent once at boot
+ * (Init_Start()/StartTask02) to actively request CC's real time - the
+ * LNC-initiated counterpart to the CC-initiated TAG_GET_SYSTEM_TIME_REQUEST
+ * above (same tag, opposite direction; CC already has its own
+ * buildGetSystemTimeRequest() for the reverse case). No payload at all.
+ */
+uint16_t Message_BuildGetSystemTimeRequest(uint8_t *out_buffer, uint16_t out_buffer_size);
 
 /* ============================================================
  * Timestamp + one flag byte

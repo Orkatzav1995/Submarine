@@ -27,9 +27,13 @@
  *     unrecognized tag, is silently ignored - same spirit as the frozen
  *     protocol's "unknown tags dropped silently".
  *   - sendFrame(): forward an already-built frame straight to the serial
- *     port. Communication does not build outgoing frames itself - that's
- *     the (not yet built) Management Command module's job, using
- *     message.h's buildXxx functions.
+ *     port. Communication does not build outgoing command frames itself -
+ *     that's Management Command's job, using message.h's buildXxx
+ *     functions. The one exception (Phase 1, LNC Timestamp/RTC Hardening):
+ *     TAG_GET_SYSTEM_TIME_REQUEST, now actively sent by the LNC at boot,
+ *     is answered immediately and synchronously inline (this PC's own
+ *     real time via std::time(nullptr)) - a mechanical auto-reply, not a
+ *     "command," so no callback or Management Command involvement.
  *   - Track framesDispatched / decodeErrors counters, mirroring the LNC's
  *     g_frames_decoded_ok / g_frames_decode_error, for observability and
  *     for tests to check against without intercepting every callback.
@@ -38,7 +42,7 @@
  *   - Know about SOF, Tag, Length, or CRC internals (Protocol's job).
  *   - Implement the LNC's 3-tier TX priority queue - that is an LNC-only
  *     requirement (Sec 2.5); the CC sends one frame at a time.
- *   - Build outgoing command frames.
+ *   - Build outgoing command frames - except the one auto-reply above.
  *   - Touch a database, the Ground Station / Ethernet side, or any UI.
  */
 

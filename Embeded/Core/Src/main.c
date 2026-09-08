@@ -37,6 +37,7 @@
 #include "keepalive.h"
 #include "communication.h"
 #include "tx_queue.h"
+#include "rtc_sync.h"
 #include "task.h" /* DIAGNOSTIC - raw FreeRTOS task API (uxTaskGetStackHighWaterMark, xPortGetFreeHeapSize) for the freeze investigation */
 /* USER CODE END Includes */
 
@@ -47,6 +48,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* Phase 1 (LNC Timestamp/RTC Hardening): a fixed, arbitrary-but-distinctive
+ * value written to RTC_BKP_DR0 only after a fully successful RTC
+ * synchronization (see RtcSync_ApplyEpoch() below). Confirmed via a
+ * repository-wide search that no other project code or CubeMX-generated
+ * file uses this backup register for anything else. */
+#define RTC_SYNC_MARKER 0x52544301UL
+
+/* Valid RTC_DateTypeDef.Year range (uint8_t offset from 2000, per the
+ * STM32 HAL) - bounds which Unix epochs can actually be applied to this
+ * RTC. Below 946684800 (2000-01-01) or above 4102444799 (2099-12-31) is
+ * not representable and must be rejected by RtcSync_ApplyEpoch(). */
+#define RTC_SYNC_MIN_EPOCH 946684800UL
+#define RTC_SYNC_MAX_EPOCH 4102444799UL
 
 /* USER CODE END PD */
 
@@ -100,7 +115,7 @@ const osThreadAttr_t ObjectDetection_attributes = {
 osThreadId_t CommRxTaskHandle;
 const osThreadAttr_t CommRxTask_attributes = {
   .name = "CommRxTask",
-  .stack_size = 128 * 4,
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* Definitions for CommTxTask */
@@ -240,6 +255,16 @@ volatile uint8_t g_rtc_hour = 0;
 volatile uint8_t g_rtc_minute = 0;
 volatile uint8_t g_rtc_second = 0;
 volatile uint32_t g_rtc_timestamp = 0;
+
+/* Phase 1 (LNC Timestamp/RTC Hardening): true once the RTC has been set
+ * from a real CC-supplied epoch since the last boot (via either
+ * TAG_SET_RTC_DATETIME or TAG_SYSTEM_TIME_RESPONSE), or restored at boot
+ * via the RTC_BKP_DR0 marker. Deliberately kept private to this file -
+ * every other module queries it only through RtcSync_IsSynchronized()
+ * (rtc_sync.h), never by name. See RtcSync_IsSynchronized()/
+ * RtcSync_ApplyEpoch() further down for the only code that reads/writes
+ * this variable. */
+static volatile uint8_t rtc_synchronized = 0;
 
 /* TEMPORARY Log write-path diagnostics - the FatFs result of the last
    f_open()/f_write()/f_close() call inside Log_Write(), so we can see
@@ -743,7 +768,20 @@ static void MX_RTC_Init(void)
   }
 
   /* USER CODE BEGIN Check_RTC_BKUP */
-
+  /* Phase 1 (LNC Timestamp/RTC Hardening): RTC_BKP_DR0 lives in the same
+   * backup domain as the RTC calendar itself - it survives a software
+   * reset and, as long as VBAT is maintained, a power cycle. If a
+   * previous successful sync left our marker there, the RTC's current
+   * value was carried over too, so the fixed default below is skipped
+   * and the retained value is trusted immediately. If the marker is
+   * missing (first-ever boot, or the backup domain lost power - both
+   * look identical from software, by design, see PROJECT_GUIDE.md), the
+   * default set below runs and the LNC stays unsynchronized until a
+   * real sync happens. */
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) == RTC_SYNC_MARKER)
+  {
+    rtc_synchronized = 1;
+  }
   /* USER CODE END Check_RTC_BKUP */
 
   /** Initialize RTC and set the Time and Date
@@ -1056,6 +1094,123 @@ static uint32_t DateToEpoch(uint16_t year, uint8_t month, uint8_t day, uint8_t h
     return (days * 86400UL) + ((uint32_t)hour * 3600UL) + ((uint32_t)minute * 60UL) + second;
 }
 
+/* Phase 1 (LNC Timestamp/RTC Hardening): the exact inverse of DateToEpoch()
+ * above - converts a Unix epoch timestamp back into calendar fields, so a
+ * CC-supplied epoch (TAG_SET_RTC_DATETIME / TAG_SYSTEM_TIME_RESPONSE) can
+ * be applied to the RTC. Same "simple counting loop, no library date
+ * functions" style as DateToEpoch()/log.c's own EpochToDate() - not
+ * reused from log.c because that one is private/date-only (no time-of-day)
+ * and log.c is explicitly do-not-touch (PROJECT_GUIDE.md). Mathematically
+ * valid for the full uint32_t range (1970-01-01 through 2106-02-07), but
+ * callers must separately bound-check against RTC_SYNC_MIN_EPOCH/
+ * RTC_SYNC_MAX_EPOCH first - RTC_DateTypeDef.Year is a uint8_t offset from
+ * 2000, so only 2000-2099 can actually be written to the RTC hardware. */
+static void EpochToCalendar(uint32_t epochSeconds, uint16_t *outYear, uint8_t *outMonth,
+                             uint8_t *outDay, uint8_t *outHour, uint8_t *outMinute, uint8_t *outSecond)
+{
+    static const uint8_t daysInMonth[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    uint32_t remaining = epochSeconds;
+    uint32_t daysSinceEpoch;
+    uint16_t year = 1970;
+    uint8_t month = 0;
+
+    *outSecond = (uint8_t)(remaining % 60UL); remaining /= 60UL;
+    *outMinute = (uint8_t)(remaining % 60UL); remaining /= 60UL;
+    *outHour   = (uint8_t)(remaining % 24UL); remaining /= 24UL;
+    daysSinceEpoch = remaining;
+
+    for (;;)
+    {
+        uint16_t daysInThisYear = IsLeapYearForRtc(year) ? 366 : 365;
+        if (daysSinceEpoch < daysInThisYear)
+        {
+            break;
+        }
+        daysSinceEpoch -= daysInThisYear;
+        year++;
+    }
+    *outYear = year;
+
+    for (;;)
+    {
+        uint8_t dim = daysInMonth[month];
+        if (month == 1 && IsLeapYearForRtc(year)) /* February */
+        {
+            dim = 29;
+        }
+        if (daysSinceEpoch < dim)
+        {
+            break;
+        }
+        daysSinceEpoch -= dim;
+        month++;
+    }
+    *outMonth = (uint8_t)(month + 1);
+    *outDay = (uint8_t)(daysSinceEpoch + 1);
+}
+
+/* Phase 1 (LNC Timestamp/RTC Hardening): the only code anywhere that reads
+ * "rtc_synchronized" - every other module queries this function instead
+ * (rtc_sync.h), never the variable itself. */
+int RtcSync_IsSynchronized(void)
+{
+    return rtc_synchronized ? 1 : 0;
+}
+
+/* Phase 1 (LNC Timestamp/RTC Hardening): the single shared path both
+ * TAG_SET_RTC_DATETIME and TAG_SYSTEM_TIME_RESPONSE use to actually apply
+ * a CC-supplied epoch to the RTC (communication.c calls this - see its
+ * own two dispatch cases). Validates the epoch is representable by this
+ * RTC's hardware (RTC_DateTypeDef.Year is a uint8_t offset from 2000),
+ * converts it, sets the RTC, and - only on full success - writes the
+ * backup marker and marks synchronized. On any failure, returns 0 without
+ * writing the marker or changing rtc_synchronized, so a partially-applied
+ * value is never trusted, this boot or after a future reboot. */
+int RtcSync_ApplyEpoch(uint32_t epochSeconds)
+{
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
+    uint16_t year;
+    uint8_t month, day, hour, minute, second;
+
+    if (epochSeconds < RTC_SYNC_MIN_EPOCH || epochSeconds > RTC_SYNC_MAX_EPOCH)
+    {
+        return 0;
+    }
+
+    EpochToCalendar(epochSeconds, &year, &month, &day, &hour, &minute, &second);
+
+    sTime.Hours = hour;
+    sTime.Minutes = minute;
+    sTime.Seconds = second;
+    sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+    if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return 0;
+    }
+
+    /* WeekDay is never actually read anywhere in this project (DateToEpoch/
+     * EpochToCalendar don't use it, nothing downstream queries it) - a
+     * fixed placeholder matches MX_RTC_Init()'s own existing precedent
+     * exactly (it also hardcodes RTC_WEEKDAY_MONDAY regardless of the
+     * real date). HAL_RTC_SetDate() asserts WeekDay is a valid enum value
+     * (stm32l4xx_hal_rtc.c), so this isn't optional - leaving it at 0
+     * would fail that check if full asserts are ever enabled. */
+    sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+    sDate.Month = month;
+    sDate.Date = day;
+    sDate.Year = (uint8_t)(year - 2000);
+    if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return 0;
+    }
+
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, RTC_SYNC_MARKER);
+    rtc_synchronized = 1;
+    return 1;
+}
+
 /* DIAGNOSTIC (round 5, Object Detection freeze investigation) - see the
  * globals/attributes in USER CODE BEGIN PV for the full explanation.
  * Toggles RGB_LED_2 (PA8, blue channel - unused by Event) directly via
@@ -1246,9 +1401,22 @@ void StartTask03(void *argument)
 
     {
       MeasurementSample sample;
+      RTC_TimeTypeDef rtcTime;
+      RTC_DateTypeDef rtcDate;
+      uint32_t timestamp;
 
-      Monitor_Sample(g_monitor_test_timestamp, &sample);
-      g_monitor_test_timestamp += 5; /* matches this loop's real 5s cadence - no RTC exists yet */
+      /* Phase 1 (LNC Timestamp/RTC Hardening): real RTC read, same
+         pattern already proven in CommRxTask/KeepAliveTask - g_monitor_
+         test_timestamp is no longer used for the production timestamp
+         (see PROJECT_GUIDE.md). HAL_RTC_GetTime() must be called before
+         HAL_RTC_GetDate() even though only the date is used elsewhere -
+         a real STM32 HAL requirement, not a style choice. */
+      HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN);
+      HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN);
+      timestamp = DateToEpoch(2000 + rtcDate.Year, rtcDate.Month, rtcDate.Date,
+                               rtcTime.Hours, rtcTime.Minutes, rtcTime.Seconds);
+
+      Monitor_Sample(timestamp, &sample);
 
       g_monitor_last_temperature = sample.temperature;
       g_monitor_last_humidity = sample.humidity;
@@ -1308,13 +1476,27 @@ void StartTask04(void *argument)
      other module's fake test clock. */
   for(;;)
   {
+    RTC_TimeTypeDef rtcTime;
+    RTC_DateTypeDef rtcDate;
+    uint32_t timestamp;
+
     g_object_detection_poll_count++; /* DIAGNOSTIC step 1 - counts every loop entry, unconditionally, first thing */
 
+    /* Phase 1 (LNC Timestamp/RTC Hardening): real RTC read, same pattern
+       already proven in CommRxTask/KeepAliveTask/MonitorTask -
+       g_object_detection_test_timestamp is no longer used for the
+       production timestamp (see PROJECT_GUIDE.md). A fast, non-blocking
+       pair of register reads every 20ms poll, same reasoning CommRxTask's
+       own comment already documents for its own per-frame RTC read. */
+    HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN);
+    timestamp = DateToEpoch(2000 + rtcDate.Year, rtcDate.Month, rtcDate.Date,
+                             rtcTime.Hours, rtcTime.Minutes, rtcTime.Seconds);
+
     g_od_diag_before_poll = g_object_detection_poll_count; /* DIAGNOSTIC step 2 */
-    ObjectDetection_Poll(g_object_detection_test_timestamp);
+    ObjectDetection_Poll(timestamp);
     g_od_diag_after_poll = g_object_detection_poll_count; /* DIAGNOSTIC step 3 */
 
-    g_object_detection_test_timestamp++;
     g_object_detection_last_state = ObjectDetection_GetCurrentState();
     g_object_detection_raw_ir_state = ObjectDetection_GetRawReading(); /* DIAGNOSTIC - see PV comment */
     g_object_detection_raw_gpio_level = (HAL_GPIO_ReadPin(IR_GPIO_Port, IR_Pin) == GPIO_PIN_SET) ? 1 : 0; /* DIAGNOSTIC - direct GPIO read, bypasses ir.c entirely */

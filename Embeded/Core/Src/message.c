@@ -119,6 +119,21 @@ int Message_ParseGetSystemTimeRequest(const ProtocolFrame *frame)
     return (frame->tag == TAG_GET_SYSTEM_TIME_REQUEST && frame->length == 0) ? 1 : 0;
 }
 
+int Message_ParseSystemTimeResponse(const ProtocolFrame *frame, TimestampMessage *out_message)
+{
+    if (frame->tag != TAG_SYSTEM_TIME_RESPONSE || frame->length != TIMESTAMP_SIZE)
+    {
+        return 0;
+    }
+    out_message->timestamp = DeserializeUint32(frame->value);
+    return 1;
+}
+
+uint16_t Message_BuildGetSystemTimeRequest(uint8_t *out_buffer, uint16_t out_buffer_size)
+{
+    return Protocol_EncodeFrame((uint8_t)TAG_GET_SYSTEM_TIME_REQUEST, NULL, 0, out_buffer, out_buffer_size);
+}
+
 /* ============================================================
  * Timestamp + one flag byte
  * ============================================================ */

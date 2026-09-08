@@ -2,10 +2,11 @@
  * cc_main.cpp
  *
  * Purpose:
- *   The Central Computer's real entry point - the first file that
- *   constructs Communication, DataStore, DataCollection, ManagementCommand,
- *   and report_generator together and actually runs them, instead of each
- *   being exercised in isolation by its own test executable.
+ *   The Central Computer's real entry point - the first file that starts a
+ *   CentralComputer (Sec 5's facade, owning Communication, DataStore,
+ *   DataCollection, ManagementCommand, and GsCommunication together) and
+ *   actually runs it, instead of each piece being exercised in isolation
+ *   by its own test executable.
  *
  *   Unlike every other file in this codebase, this one is NOT unit-tested
  *   with a check()-based PC test - it's a real entry point with a real
@@ -14,33 +15,37 @@
  *   real board (see PROJECT_GUIDE.md).
  *
  * Layer:
- *   Application entry point. Sits above everything else, owns all of it.
+ *   Application entry point. Sits above CentralComputer, owns it.
  *
  * Responsibilities:
- *   - Construct the pieces in the right order (DataStore opened before
- *     DataCollection is built, so it's ready to receive inserts the
- *     moment DataCollection registers its callbacks).
- *   - Open the real COM10 link.
- *   - Listen for a Ground Station connection on TCP port 5000
- *     (gs_communication::GsCommunication, sharing the same DataStore the
- *     LNC side already fills - see PROJECT_GUIDE.md's Step 4).
- *   - Run a single-threaded loop: poll() both the LNC connection (a real
- *     blocking ReadFile with a short timeout underneath - no
- *     busy-spinning, no osDelay-equivalent needed, unlike the LNC's
- *     bare-metal polling) and the Ground Station connection, and check
- *     for a keypress without blocking (_kbhit()/_getch() - this codebase
- *     is already Windows-only, see serial_transport.cpp).
+ *   - Construct one CentralComputer and start() it (this opens the
+ *     database, listens for a Ground Station connection on TCP port 5000,
+ *     and opens the real COM10 link, in that order - see
+ *     central_computer.h).
+ *   - Run a single-threaded loop: poll() the CentralComputer (which polls
+ *     both the LNC connection - a real blocking ReadFile with a short
+ *     timeout underneath, no busy-spinning, no osDelay-equivalent needed,
+ *     unlike the LNC's bare-metal polling - and the Ground Station
+ *     connection) and check for a keypress without blocking
+ *     (_kbhit()/_getch() - this codebase is already Windows-only, see
+ *     serial_transport.cpp).
  *   - Offer a tiny menu so the real hardware can actually be exercised on
  *     demand, since the LNC currently has no application layer of its own
  *     (see the menu actions' own comments below for exactly what each one
  *     does and does not prove).
  *   - Print visible status to the console - every module below this one
  *     is deliberately silent (no logging), so this is the one place
- *     that's allowed to talk to the operator.
+ *     that's allowed to talk to the operator. CentralComputer itself
+ *     prints nothing (see its own header comment) - all FATAL/WARNING/
+ *     Connected messages below are decided and printed here.
  *
  * This file does NOT:
  *   - Add any new behavior beyond what the existing modules already do -
  *     it only calls their already-tested public functions.
+ *   - Construct Communication/DataStore/ManagementCommand/DataCollection/
+ *     GsCommunication itself anymore - central_computer.h is the only CC
+ *     module header this file needs, plus report_generator.h (used
+ *     directly against DataStore for the report menu option).
  *   - Auto-sync time or auto-trigger a backfill at startup - the spec's
  *     Init concept (Sec 2.7) is LNC-only; nothing requires CC-side startup
  *     behavior, so none is invented here.
@@ -48,11 +53,7 @@
  *     baud rate, and database path are plain constants below.
  */
 
-#include "communication.h"
-#include "data_collection.h"
-#include "data_store.h"
-#include "gs_communication.h"
-#include "management_command.h"
+#include "central_computer.h"
 #include "report_generator.h"
 #include "tlv_common.h"
 #include <conio.h>
@@ -223,33 +224,29 @@ int main()
 {
     std::printf("=== Central Computer ===\n");
 
-    communication::Communication comm;
+    central_computer::CentralComputer cc;
 
-    data_store::DataStore store;
-    if (!store.open(kDatabasePath))
+    if (!cc.start(kComPortName, kBaudRate, kDatabasePath, kGsPort))
     {
         std::printf("FATAL: could not open database '%s'\n", kDatabasePath);
         return 1;
     }
     std::printf("Database opened: %s\n", kDatabasePath);
 
-    data_collection::DataCollection collection(comm, store);
-    collection.onMeasurementBackfillComplete = []() { std::printf("\n[backfill] measurement backfill complete\n"); };
-    collection.onEventBackfillComplete = []() { std::printf("\n[backfill] event backfill complete\n"); };
+    cc.dataCollection().onMeasurementBackfillComplete = []()
+    { std::printf("\n[backfill] measurement backfill complete\n"); };
+    cc.dataCollection().onEventBackfillComplete = []() { std::printf("\n[backfill] event backfill complete\n"); };
 
     /* HW-B-C-03: onSystemTimeResponse already existed as a callback slot
        on Communication but nothing registered a handler for it - this is
        the minimum needed to observe the reply to [6] below. */
-    comm.callbacks.onSystemTimeResponse = [](const message::TimestampMessage &response)
+    cc.communication().callbacks.onSystemTimeResponse = [](const message::TimestampMessage &response)
     { std::printf("\n[reply] system time response: timestamp=%u\n", response.timestamp); };
-
-    management_command::ManagementCommand mgmt(comm);
 
     /* GS's server side shares the same DataStore the LNC side already
        fills - a GS query answers from the exact same measurement/event
        history CC has collected, not a second, separate store. */
-    gs_communication::GsCommunication gsComm(store);
-    if (gsComm.startListening(kGsPort))
+    if (cc.gsCommunication().isListening())
     {
         std::printf("Listening for Ground Station on TCP port %u.\n", kGsPort);
     }
@@ -259,7 +256,7 @@ int main()
                     kGsPort);
     }
 
-    if (comm.open(kComPortName, kBaudRate))
+    if (cc.communication().isOpen())
     {
         std::printf("Connected to %s at %u baud.\n", kComPortName, kBaudRate);
     }
@@ -274,8 +271,7 @@ int main()
     bool running = true;
     while (running)
     {
-        comm.poll();
-        gsComm.poll();
+        cc.poll();
 
         if (_kbhit())
         {
@@ -283,22 +279,22 @@ int main()
             switch (key)
             {
                 case '1':
-                    handleSendTestCommand(mgmt);
+                    handleSendTestCommand(cc.managementCommand());
                     break;
                 case '2':
-                    handleRequestBackfill(collection);
+                    handleRequestBackfill(cc.dataCollection());
                     break;
                 case '3':
-                    printStatus(comm, collection, gsComm);
+                    printStatus(cc.communication(), cc.dataCollection(), cc.gsCommunication());
                     break;
                 case '4':
-                    printReport(store);
+                    printReport(cc.dataStore());
                     break;
                 case '5':
-                    handleSetTempNormalRange(mgmt);
+                    handleSetTempNormalRange(cc.managementCommand());
                     break;
                 case '6':
-                    handleRequestSystemTime(mgmt);
+                    handleRequestSystemTime(cc.managementCommand());
                     break;
                 case 'q':
                 case 'Q':
@@ -316,8 +312,6 @@ int main()
     }
 
     std::printf("\nClosing...\n");
-    comm.close();
-    gsComm.close();
-    store.close();
+    cc.stop();
     return 0;
 }

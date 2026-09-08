@@ -31,18 +31,25 @@
  *     SendSystemTimeResponse() for why that tier was chosen among the
  *     3 Sec 7 defines) - the first real request/response round trip on
  *     the LNC.
+ *   - Phase 1 (LNC Timestamp/RTC Hardening): TAG_SET_RTC_DATETIME - parse,
+ *     then apply the epoch to the RTC via RtcSync_ApplyEpoch() (rtc_sync.h).
+ *     The existing manual CC-push synchronization mechanism.
+ *   - Phase 1: TAG_SYSTEM_TIME_RESPONSE - parse, then apply via the same
+ *     RtcSync_ApplyEpoch() - CC's reply to the LNC's own boot-time
+ *     TAG_GET_SYSTEM_TIME_REQUEST (Init_Start(), init.c). The new,
+ *     active, LNC-initiated synchronization mechanism; both mechanisms
+ *     share the same RTC-application logic and are equally supported.
  *   - Count what happened (see the getters below) so hardware testing can
  *     watch dispatch activity live in the debugger, same convention as
  *     every other module.
  *
  * This file does NOT:
- *   - Read the RTC - the caller supplies "timestamp" (same pattern as
- *     every other module: Monitor_Sample(), Init_Start(), KeepAlive_Send()).
- *   - Act on TAG_SET_RTC_DATETIME. Deliberately deferred: MX_RTC_Init()
- *     currently re-applies its placeholder boot time unconditionally on
- *     every reset (see PROJECT_GUIDE.md's RTC entry) - setting a real time
- *     now would just be lost on the next reset. Needs the RTC
- *     backup-register guard first.
+ *   - Read the RTC directly - the caller supplies "timestamp" for the
+ *     tags that need one (same pattern as every other module:
+ *     Monitor_Sample(), Init_Start(), KeepAlive_Send()); RTC reads/writes
+ *     for TAG_SET_RTC_DATETIME/TAG_SYSTEM_TIME_RESPONSE go through
+ *     rtc_sync.h's RtcSync_ApplyEpoch(), implemented in main.c where the
+ *     RTC handle lives - this file never touches HAL RTC functions itself.
  *   - Act on TAG_GET_MEASUREMENTS_BY_RANGE_REQUEST or
  *     TAG_GET_EVENTS_BY_RANGE_REQUEST. Deliberately deferred: replying
  *     needs historical data read back from the SD card's dated .LOG/.TXT
@@ -84,7 +91,8 @@ uint32_t Communication_GetSetLimitCount(void);
 uint32_t Communication_GetSystemTimeRequestCount(void);
 
 /* Number of frames whose Tag is recognized but intentionally not yet
- * acted upon (SET_RTC_DATETIME, the 2 retrieve-by-range requests). */
+ * acted upon (the 2 retrieve-by-range requests - SET_RTC_DATETIME is no
+ * longer deferred as of Phase 1, LNC Timestamp/RTC Hardening). */
 uint32_t Communication_GetDeferredCount(void);
 
 /* Number of frames whose Tag is not recognized at all (matches the

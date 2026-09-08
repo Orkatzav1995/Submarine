@@ -76,6 +76,20 @@ std::vector<uint8_t> buildSetRtcDateTime(const TimestampMessage &message);
 /* A request with no payload at all. */
 std::vector<uint8_t> buildGetSystemTimeRequest();
 
+/*
+ * Phase 1 (LNC Timestamp/RTC Hardening): the reverse direction of the two
+ * functions above. The LNC now also sends TAG_GET_SYSTEM_TIME_REQUEST
+ * (once, at boot) to actively ask CC for the real time - CC previously
+ * only ever built this request (to send to the LNC) and parsed the
+ * LNC's reply; it never needed to parse an incoming request or build a
+ * reply of its own, because it was never the one being asked. Same "missing
+ * other half of an already-existing message type" pattern already used
+ * for the chunk-response builders (Step 1) and the range-request parsers
+ * (Step 4b). No new tag, no new struct - TimestampMessage is reused as-is.
+ */
+std::optional<TimestampMessage> parseGetSystemTimeRequest(const tlv::Frame &frame);
+std::vector<uint8_t> buildSystemTimeResponse(const TimestampMessage &message);
+
 /* ============================================================
  * Timestamp + one flag byte
  * ============================================================ */

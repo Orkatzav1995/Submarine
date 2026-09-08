@@ -9,11 +9,19 @@
  *
  * This file does NOT:
  *   - Know about SOF, Tag, Length, or CRC internals (that's tlv_codec.h).
- *   - Build outgoing command frames.
+ *   - Build outgoing command frames - Management Command's job (not yet
+ *     built when this was first written; still true for real commands).
+ *     The one exception, added in Phase 1 (LNC Timestamp/RTC Hardening):
+ *     TAG_GET_SYSTEM_TIME_REQUEST is answered immediately and
+ *     synchronously, inline, with no Application-layer callback - a
+ *     mechanical auto-reply using this PC's own real time, not a
+ *     "command" CC decides to issue, the same reasoning that already
+ *     lets the LNC's own communication.c reply to this exact tag inline.
  */
 
 #include "communication.h"
 #include "tlv_common.h"
+#include <ctime>
 
 namespace communication {
 
@@ -90,6 +98,24 @@ void Communication::dispatch(const tlv::Frame &frame)
                 {
                     callbacks.onSystemTimeResponse(*parsed);
                 }
+            }
+            break;
+
+        /* Phase 1 (LNC Timestamp/RTC Hardening): the LNC now actively
+           requests the real time once at boot (Init_Start()) - this is
+           CC's automatic reply, using this PC's own real time. Answered
+           immediately and synchronously, inline, with no callback - see
+           this file's header comment for why. The existing, unrelated
+           TAG_GET_SYSTEM_TIME_REQUEST/RESPONSE pair CC itself sends (via
+           ManagementCommand::requestSystemTime(), cc_main.cpp's [6]) is
+           untouched - this is purely the new, opposite direction. */
+        case TAG_GET_SYSTEM_TIME_REQUEST:
+            if (message::parseGetSystemTimeRequest(frame))
+            {
+                framesDispatched++;
+                message::TimestampMessage response;
+                response.timestamp = static_cast<uint32_t>(std::time(nullptr));
+                sendFrame(message::buildSystemTimeResponse(response));
             }
             break;
 

@@ -168,6 +168,22 @@ std::vector<uint8_t> buildGetSystemTimeRequest()
     return tlv::encodeFrame(TAG_GET_SYSTEM_TIME_REQUEST, {});
 }
 
+std::optional<TimestampMessage> parseGetSystemTimeRequest(const tlv::Frame &frame)
+{
+    if (frame.tag != TAG_GET_SYSTEM_TIME_REQUEST || !frame.value.empty())
+    {
+        return std::nullopt;
+    }
+    return TimestampMessage{};
+}
+
+std::vector<uint8_t> buildSystemTimeResponse(const TimestampMessage &message)
+{
+    std::vector<uint8_t> value;
+    appendUint32LE(value, message.timestamp);
+    return tlv::encodeFrame(TAG_SYSTEM_TIME_RESPONSE, value);
+}
+
 std::vector<uint8_t> buildGetMeasurementsByRangeRequest(const TimeRangeMessage &message)
 {
     std::vector<uint8_t> value;

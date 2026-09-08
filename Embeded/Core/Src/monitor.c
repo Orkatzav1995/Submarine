@@ -12,6 +12,7 @@
 #include "log.h"
 #include "event.h"
 #include "tx_queue.h"
+#include "rtc_sync.h"
 #include "cmsis_os.h"
 
 /* Last successfully-read DHT values - kept and reused whenever
@@ -148,12 +149,19 @@ void Monitor_Sample(uint32_t timestamp, MeasurementSample *out_sample)
      * Monitor's own periodic sample is exactly that, same "every cycle,
      * unconditionally" cadence as the Log_Write() call right above.
      * Enqueued at data priority (lowest, Sec 7) - CommTxTask sends it
-     * when nothing higher-priority (keepalive/event) is waiting. */
+     * when nothing higher-priority (keepalive/event) is waiting.
+     *
+     * Phase 1 (LNC Timestamp/RTC Hardening): the enqueue itself is gated
+     * on RtcSync_IsSynchronized() - before the RTC has ever been set from
+     * a real CC-supplied epoch, this frame's timestamp would be
+     * misleading if it reached DataStore, so it is simply never sent
+     * (this function's own sampling/classification/Log_Write() above are
+     * all unaffected - only this transmission is withheld). */
     {
         uint8_t dataFrame[32];
         uint16_t dataFrameLength = Message_BuildDataReport(out_sample, dataFrame, sizeof(dataFrame));
 
-        if (dataFrameLength > 0)
+        if (dataFrameLength > 0 && RtcSync_IsSynchronized())
         {
             TxQueue_EnqueueData(dataFrame, dataFrameLength);
         }
@@ -173,10 +181,14 @@ void Monitor_Sample(uint32_t timestamp, MeasurementSample *out_sample)
 
         /* Event writes its own record, drives the LED/buzzer, and
          * returns the CC-bound frame - now enqueued at event priority
-         * (Sec 7) so CommTxTask actually sends it. */
+         * (Sec 7) so CommTxTask actually sends it. Phase 1 (LNC
+         * Timestamp/RTC Hardening): the enqueue is gated on
+         * RtcSync_IsSynchronized(), same reasoning as the data report
+         * above - Event_OnModeTransition() itself (local record, LED,
+         * buzzer) always runs regardless. */
         frameLength = Event_OnModeTransition(&transition, frame, sizeof(frame));
 
-        if (frameLength > 0)
+        if (frameLength > 0 && RtcSync_IsSynchronized())
         {
             TxQueue_EnqueueEvent(frame, frameLength);
         }
