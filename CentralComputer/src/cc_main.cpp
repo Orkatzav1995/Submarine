@@ -258,14 +258,20 @@ void handleSetSensorLimit(management_command::ManagementCommand &mgmt)
     bool isNormal = (mode == '1');
     bool sent = false;
 
+    const char *sensorName = (sensor == '1') ? "Temperature"
+                              : (sensor == '2') ? "Humidity"
+                              : (sensor == '3') ? "Light"
+                                                 : "Battery";
+    const char *modeName = isNormal ? "Normal" : "Warning";
+
     if (sensor == '1')
     {
         float low = 0.0f;
         float high = 0.0f;
-        std::printf("Enter lower limit: ");
+        std::printf("%s %s - enter lower limit: ", sensorName, modeName);
         std::fflush(stdout);
         std::scanf("%f", &low);
-        std::printf("Enter upper limit: ");
+        std::printf("%s %s - enter upper limit: ", sensorName, modeName);
         std::fflush(stdout);
         std::scanf("%f", &high);
         sent = isNormal ? mgmt.setTempNormalRange(low, high) : mgmt.setTempWarningRange(low, high);
@@ -273,7 +279,7 @@ void handleSetSensorLimit(management_command::ManagementCommand &mgmt)
     else
     {
         float value = 0.0f;
-        std::printf("Enter lower limit: ");
+        std::printf("%s %s - enter lower limit: ", sensorName, modeName);
         std::fflush(stdout);
         std::scanf("%f", &value);
 
@@ -291,7 +297,8 @@ void handleSetSensorLimit(management_command::ManagementCommand &mgmt)
         }
     }
 
-    std::printf("\n[cmd] sendFrame result: %s\n", sent ? "ok" : "FAILED (is the port open?)");
+    std::printf("\n[cmd] %s %s -> sendFrame result: %s\n", sensorName, modeName,
+                sent ? "ok" : "FAILED (is the port open?)");
 }
 
 }  // namespace

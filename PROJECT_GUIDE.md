@@ -2551,3 +2551,85 @@ Real end-to-end test performed by the user against the real LNC board via `[7]`:
 **Sensor-Limit CLI is considered COMPLETE for the Temperature/Normal path** and structurally complete for
 all 8 combinations; the remaining 7 combinations are implemented and build-verified but await their own
 individual hardware exercise, same as documented above.
+
+---
+
+## Consecutive Sensor-Limit Commands — investigation + hardware finding (2026-09-08)
+
+A new hardware behavior was found after the Sensor-Limit CLI work above: sending two sensor-limit commands
+back-to-back could silently lose the second one. **Investigated read-only first** (no code changes during
+the investigation itself), full trace below, followed by a real-hardware timing test.
+
+### Symptom as originally reported
+- Send one sensor-limit command after a reset: works correctly, LNC updates and confirms.
+- Send a second sensor-limit command **immediately** after the first: the first succeeds; the second does
+  not appear to be sent/processed at all.
+
+### Investigation trace (CC CLI -> ManagementCommand -> sendFrame -> UART -> LNC RX -> dispatch -> Configuration)
+- **CC side**: nothing wrong found. `Communication::sendFrame()` has no "busy" state, `lastSentFrame` is
+  unconditionally overwritten each call, and `WriteFile()` doesn't know or care about LNC readiness - the
+  second `sendFrame()` call almost certainly still returns `true`/"ok" from the CC's point of view.
+- **LNC dispatch path for the first command**: `CommRxTask` -> `Protocol_FeedByte()` completes the frame
+  -> `Communication_Dispatch()`'s `TAG_SET_TEMP_NORMAL_RANGE` case calls
+  `Config_SetTempNormalRange()` -> `Save()` -> `FlashStorage_Write()`
+  (`Embeded/Core/Src/flash_storage.c`), which calls `HAL_FLASHEx_Erase()` (a full 2KB page erase) then
+  `HAL_FLASH_Program()` for each double-word. **These are blocking, polling HAL calls that do not yield to
+  the scheduler** - `CommRxTask` itself is occupied for the entire duration, which for a full page erase on
+  this MCU is on the order of tens of milliseconds, every single time any of the 8 "set limit" commands is
+  dispatched (this is not a rare condition - it happens on every call, by the current design).
+- **Root cause identified**: while `CommRxTask` is inside this blocking flash write from the *first*
+  command, it is not calling `Transport_UART_ReceiveByte()` at all. A 14-byte frame takes only ~1.2ms to
+  arrive on the wire at 115200 baud - far shorter than the flash-write window - so if the CC sends a second
+  command "immediately," the *entire* second frame arrives and is lost to UART hardware overrun while
+  nobody is draining `RDR`: the first byte to arrive gets latched, every byte after it re-triggers Overrun
+  (`ORE`) and is discarded, since nothing reads `RDR` out.
+- **Relationship to the Command-[5] UART overrun investigation (documented earlier in this file)**:
+  **same underlying hardware mechanism** (overrun because nobody drains `RDR` in time), but **a different,
+  new, and fully deterministic trigger** - not FreeRTOS scheduling jitter racing a long frame (probabilistic,
+  worse for longer frames), but a guaranteed ~tens-of-ms synchronous flash write inside the dispatch path
+  itself, on every set-limit command. Per explicit instruction, this was investigated as a related-but-
+  distinct mechanism, not assumed to be identical to the earlier finding.
+- **Exact divergence point**: the two paths are identical through `Communication_Dispatch()`'s entry into
+  `Config_SetTempNormalRange()`. They diverge the instant the first command's `Save()` begins its blocking
+  flash erase - the second frame's bytes arrive and are lost during that specific window, before
+  `CommRxTask` ever gets a chance to look at them.
+- Checked and ruled out: no CC-side stuck state/flag; no CC-side or LNC-side TX queue involvement (the
+  LNC's `txQueueEvent`, used only for the outbound "config changed" notification, is independent of RX/
+  dispatch); no mutex/semaphore exists in this path (`Configuration` has none, by original design - though
+  this is a separate, pre-existing, unrelated observation: `MonitorTask` reads `Config_Get*()` with no
+  synchronization against a setter's in-progress write, worth remembering if it ever becomes relevant).
+- **Not directly confirmed via live debugger register inspection** (`huart2.ErrorCode`/`RxState` and
+  `FlashStorage_Write()`'s exact measured duration) as part of the investigation itself - the mechanism was
+  traced from source, not yet observed live at the register level. The real-hardware timing test below is
+  independent, indirect corroboration.
+
+### Real-hardware timing verification (2026-09-08)
+- **20ms delay between consecutive sensor-limit commands: NOT reliable.** This matches the symptom
+  originally reported and the investigation above almost exactly - 20ms is well inside the expected
+  tens-of-milliseconds blocking window of a single flash page erase, so a second command sent only 20ms
+  after the first can easily still land inside that window.
+- **50ms delay between consecutive sensor-limit commands: tested on real hardware, and sensor-limit
+  commands were sent and processed correctly repeatedly** at this spacing - the user was able to
+  repeatedly change configuration values across multiple consecutive commands without the earlier failure.
+- **This result is consistent with, and supports, the investigation's finding**: a delay comfortably longer
+  than the blocking flash-write window avoids the overrun window entirely, which is exactly the predicted
+  behavior if the flash-write-blocks-`CommRxTask` mechanism above is the real cause.
+- **50ms is the currently verified working delay - stated precisely, not generously.** This is an
+  empirical, timing-based observation on this specific hardware, not a structural/architectural fix. **The
+  underlying architectural issue - `Config_SetXxx()`'s blocking flash write running directly inside
+  `CommRxTask`'s dispatch path - has NOT been fixed and still exists.** A sufficiently short delay (below
+  the actual flash-write duration on this specific board, which was not itself directly measured) could
+  still reproduce the original failure; 50ms is a margin that has now been empirically confirmed to work,
+  not a value derived from a measured, guaranteed-safe bound.
+
+### Status and possible future improvement (not implemented, not scheduled)
+- No source code was changed as part of either the investigation or this hardware finding. Watchdog, the
+  Sensor-Limit CLI, UART, Configuration, and FlashStorage all remain exactly as previously documented.
+- **Possible future improvement, if this limitation is ever judged to matter enough to address**: move
+  `Config_SetXxx()`'s actual flash write off `CommRxTask`'s critical path (update the in-RAM value
+  immediately, defer the blocking `FlashStorage_Write()` call itself to run outside the RX dispatch path) so
+  `CommRxTask` returns to servicing the UART almost immediately instead of blocking for the full erase+
+  program duration. This would be a real change to `Configuration`'s current "save to flash immediately"
+  contract (stated explicitly in its own header comment) - a design decision requiring explicit approval,
+  not a one-line tweak. **Not implemented. Not currently planned - recorded here only so this option isn't
+  lost if the 50ms-delay workaround is ever judged insufficient.**
