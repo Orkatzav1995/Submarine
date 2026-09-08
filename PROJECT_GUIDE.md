@@ -2451,3 +2451,103 @@ this mechanism is firing. Two options, in order of preference:
    needs to be caught mid-run rather than only at a breakpoint.
 
 **No source files were modified as part of this investigation - documentation only.**
+
+---
+
+## Sensor-Limit CLI — COMPLETE and hardware-verified (2026-09-08)
+
+Closes the CLI gap identified by the "sensor-limit CLI" investigation earlier this session: all 8 Sec 2.5
+"set limit" management commands were already fully implemented end-to-end (protocol, `ManagementCommand`,
+LNC dispatch, LNC Configuration + flash persistence), but 7 of the 8 had no way to be sent from the running
+`cc_main.exe` at all, and the 8th (`[5]`) only sent two hardcoded test values.
+
+### Spec requirement (unchanged, quoted again for this record)
+Sec 2.5 (Communication, §2 LNC Requirements) requires the LNC to receive exactly these 8 management
+commands from CC - [PROJECT_GUIDE.md:60-72](PROJECT_GUIDE.md#L60-L72):
+> Set temperature range for Normal mode; set temperature range for Warning mode (temperature gets **both**
+> an upper and lower bound per mode). Set humidity lower boundary for Normal mode; set humidity lower
+> boundary for Warning mode (lower bound only). Set light lower boundary for Normal mode; set light lower
+> boundary for Warning mode (lower bound only). Set battery/potentiometer lower boundary for Normal mode;
+> set battery/potentiometer lower boundary for Warning mode (lower bound only).
+
+Sec 3 adds only: "**Management Command**: builds/sends management commands to the LNC" - no CLI/menu/UX
+behavior is spec-mandated; the interactive flow below is a design choice to make that requirement usable
+by an operator, not a literal requirement.
+
+### Already implemented before this change (confirmed by investigation, untouched by this change)
+All 8 combinations, at every layer below the CLI, were already complete and working:
+- **Protocol tags**: `TAG_SET_TEMP_NORMAL_RANGE` (`0x01`) through `TAG_SET_BATTERY_WARNING_LOWER` (`0x08`)
+  - `Common/Protocol/tlv_common.h`.
+- **`ManagementCommand` builder functions**: all 8 setters - `CentralComputer/include/management_command.h`
+  / `.cpp` - already unit-tested (`management_command_test.cpp`, part of the "ManagementCommand 14/14"
+  total in this project's full regression tally).
+- **LNC dispatcher**: all 8 `case TAG_SET_*` blocks in `Communication_Dispatch()` -
+  `Embeded/Core/Src/communication.c`.
+- **LNC Configuration setters + flash persistence**: all 8 `Config_Set*()` functions, each saving to flash
+  immediately - `Embeded/Core/Src/configuration.c`.
+None of these files were touched by this change - only the CLI layer was missing.
+
+### What was implemented (this session)
+**File changed: `CentralComputer/src/cc_main.cpp` only.** No other source, header, or test file touched.
+
+- **New menu option**: `[7] Configure sensor limits`, added to `printMenu()` alongside the existing
+  options - `[5]`/`[6]` left completely unchanged (still print, still behave, still labeled as HW-B-C-02/
+  HW-B-C-03 hardware-test entry points, not the general CLI).
+- **New handler**: `handleSetSensorLimit(ManagementCommand &mgmt)` - a single function, no new classes or
+  abstractions, matching every existing handler's style exactly. Flow: select sensor (1-4) → select mode
+  (1-2) → enter value(s) → call the matching already-existing `ManagementCommand` setter → print the send
+  result → return to the main menu (which naturally supports repeating the flow any number of times in one
+  run, since the existing `while(running)` loop already re-prints the menu after every action).
+- **New `case '7'`** in the main switch, calling the new handler.
+- **All 8 combinations are now reachable from the CLI**, repeatably, in a single `cc_main.exe` run:
+
+  | Sensor | Mode | Value(s) entered | Underlying call |
+  |---|---|---|---|
+  | Temperature | Normal | lower + upper | `setTempNormalRange(low, high)` |
+  | Temperature | Warning | lower + upper | `setTempWarningRange(low, high)` |
+  | Humidity | Normal | lower only | `setHumidityNormalLower(value)` |
+  | Humidity | Warning | lower only | `setHumidityWarningLower(value)` |
+  | Light | Normal | lower only | `setLightNormalLower(value)` |
+  | Light | Warning | lower only | `setLightWarningLower(value)` |
+  | Battery | Normal | lower only | `setBatteryNormalLower(value)` |
+  | Battery | Warning | lower only | `setBatteryWarningLower(value)` |
+
+- No input validation beyond the sensor (1-4) / mode (1-2) selection range check - matches this project's
+  existing convention (`management_command.h`'s own header comment: "Validate input values ... not
+  specified by the spec"). No new automated test was added for the CLI itself, per this project's
+  established convention that `cc_main.cpp` is not unit-tested - "its 'test' is manual exercise against the
+  real board" (`cc_main.cpp`'s own header comment) - the existing `management_command_test.cpp` (14/14)
+  already fully covers every function the new menu calls.
+
+### Build verification
+- `cc_main.cpp` recompiled with the project's standard flags: **0 new warnings** (same single
+  pre-existing, unrelated `ModeName`-unused warning as always), 0 errors.
+- `cc_main.exe` relinked successfully against the existing object files (no other `.o` needed rebuilding).
+- Confirmed via `git diff`/`git status`: only `CentralComputer/src/cc_main.cpp` changed for this
+  implementation.
+
+### Hardware verification - PASS (2026-09-08)
+Real end-to-end test performed by the user against the real LNC board via `[7]`:
+- **Input**: Sensor = Temperature, Mode = Normal, Lower limit = 40, Upper limit = 50.
+- **Result**: the LNC received and applied the command. Debugger-confirmed:
+  `g_config_temp_normal_low` and `g_config_temp_normal_high` updated from their previous values to
+  **`40`** and **`50`** respectively.
+- This is a genuine, real hardware confirmation of the full path: CLI input → `ManagementCommand::
+  setTempNormalRange()` → TLV encode → UART → LNC decode → `Communication_Dispatch()` →
+  `Config_SetTempNormalRange()` → live LNC state.
+
+### What is verified vs. what remains
+- **Hardware-verified**: Temperature / Normal (the combination above) - the CLI, the send path, and the
+  LNC's receipt/application of the value.
+- **NOT yet individually hardware-tested**: the other 7 combinations (Temperature/Warning, Humidity ×2,
+  Light ×2, Battery ×2). Their underlying `ManagementCommand` functions, LNC dispatch cases, and
+  Configuration setters are the same already-tested code paths `[5]`'s prior HW-B-C-02 test and this
+  session's Temperature/Normal test both already exercise structurally (same dispatcher switch, same
+  setter-then-flash-save pattern) - but each one has not been individually exercised end-to-end via `[7]`
+  on real hardware yet. Do not claim all 8 are hardware-verified until each has actually been run.
+- `[5]`/`[6]` remain exactly as they were - unchanged, still valid HW-B-C-02/HW-B-C-03 hardware-test entry
+  points, not retired or folded into `[7]`.
+
+**Sensor-Limit CLI is considered COMPLETE for the Temperature/Normal path** and structurally complete for
+all 8 combinations; the remaining 7 combinations are implemented and build-verified but await their own
+individual hardware exercise, same as documented above.

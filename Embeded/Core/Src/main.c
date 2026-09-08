@@ -1589,7 +1589,7 @@ void StartTask05(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    if (Transport_UART_ReceiveByte(&received_byte, 20) == 1)
+    if (Transport_UART_ReceiveByte(&received_byte, 50) == 1)
     {
       status = Protocol_FeedByte(&decoder, received_byte, &decoded_frame);
 
