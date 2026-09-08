@@ -14,7 +14,7 @@
 
 static uint16_t s_lastStartupFrameLength = 0;
 
-void Init_Start(uint32_t timestamp)
+void Init_Start(uint32_t timestamp, uint8_t wasWatchdogReset)
 {
     TimestampWithFlagMessage startup;
     uint8_t frame[64];
@@ -24,7 +24,7 @@ void Init_Start(uint32_t timestamp)
     Event_Init();
 
     startup.timestamp = timestamp;
-    startup.flag = 0; /* no watchdog exists yet - PROJECT_GUIDE.md Open Question #2 */
+    startup.flag = wasWatchdogReset;
 
     /* Event_OnInitStartup() itself (local events-file record, LED/buzzer)
      * always runs, unconditionally, regardless of RTC synchronization -

@@ -17,9 +17,7 @@
  *     order - replacing the ad-hoc calls that used to live directly in
  *     main.c's StartTask02, with no change to what each call does.
  *   - Report a startup event to Event via Event_OnInitStartup(), using
- *     the timestamp the caller passes in, and wasWatchdogReset=0 (no
- *     watchdog exists in this project right now - PROJECT_GUIDE.md
- *     Open Question #2).
+ *     the timestamp and wasWatchdogReset flag the caller passes in.
  *
  * This file does NOT:
  *   - Read the hardware RTC, or any other time source, itself.
@@ -33,8 +31,11 @@
  *   - Implement any LNC->CC time-sync round trip - deferred, needs new
  *     message-layer pieces that don't exist yet (PROJECT_GUIDE.md Sec
  *     15).
- *   - Touch the Watchdog (Sec 2.9) in any way - a separate, later
- *     roadmap step, deliberately paused (Open Question #2).
+ *   - Contain any watchdog logic itself (no IWDG access, no reset-flag
+ *     reading) - it only receives the already-determined wasWatchdogReset
+ *     flag as a plain parameter, the same convention as the timestamp
+ *     parameter above. Reading RCC_FLAG_IWDGRST is main()'s
+ *     responsibility, at boot, before this function is ever called.
  *   - Own a FreeRTOS task - called once from the existing InitTask
  *     (StartTask02) in main.c, same as before this file existed.
  *   - Initialize Monitor or Object Detection - each of those still
@@ -55,9 +56,9 @@ extern "C" {
 
 /* Runs the LNC's one-shot boot sequence: Configuration_Init(),
  * Log_Init(), Event_Init(), then reports a startup event to Event
- * using the given timestamp. Call exactly once, at boot, from
- * InitTask. */
-void Init_Start(uint32_t timestamp);
+ * using the given timestamp and wasWatchdogReset flag. Call exactly
+ * once, at boot, from InitTask. */
+void Init_Start(uint32_t timestamp, uint8_t wasWatchdogReset);
 
 /* Test-observability getter, same spirit as every other module's
  * (Config_WasLoadedFromFlash(), Event_IsAlarmActive(), etc.) - the byte

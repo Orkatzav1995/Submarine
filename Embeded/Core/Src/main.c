@@ -74,6 +74,8 @@
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 
+IWDG_HandleTypeDef hiwdg;
+
 RTC_HandleTypeDef hrtc;
 
 SPI_HandleTypeDef hspi1;
@@ -137,7 +139,7 @@ osThreadId_t WatchdogTaskHandle;
 const osThreadAttr_t WatchdogTask_attributes = {
   .name = "WatchdogTask",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
+  .priority = (osPriority_t) osPriorityRealtime,
 };
 /* USER CODE BEGIN PV */
 /* DIAGNOSTIC (round 5, Object Detection task-freeze investigation) - a
@@ -255,6 +257,11 @@ volatile uint8_t g_rtc_hour = 0;
 volatile uint8_t g_rtc_minute = 0;
 volatile uint8_t g_rtc_second = 0;
 volatile uint32_t g_rtc_timestamp = 0;
+
+/* Set once, early in main(), from RCC_FLAG_IWDGRST before the reset
+ * flags are cleared. Passed into Init_Start(), which forwards it to
+ * Event_OnInitStartup() as the startup event's flag. */
+uint8_t g_wasWatchdogReset = 0;
 
 /* Phase 1 (LNC Timestamp/RTC Hardening): true once the RTC has been set
  * from a real CC-supplied epoch since the last boot (via either
@@ -396,6 +403,7 @@ static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_RTC_Init(void);
+static void MX_IWDG_Init(void);
 void StartDefaultTask(void *argument);
 void StartTask02(void *argument);
 void StartTask03(void *argument);
@@ -432,6 +440,13 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
+  /* Read the reset cause before anything can clear it - RCC->CSR's reset
+     flags persist across HAL_Init() and are only cleared explicitly
+     below, so this is the earliest point that reliably captures whether
+     the IWDG caused the reset preceding this boot. */
+  g_wasWatchdogReset = (uint8_t)(__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -454,6 +469,7 @@ int main(void)
   MX_ADC2_Init();
   MX_TIM3_Init();
   MX_RTC_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -730,6 +746,35 @@ static void MX_ADC2_Init(void)
   /* USER CODE BEGIN ADC2_Init 2 */
 
   /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg.Init.Window = 4095;
+  hiwdg.Init.Reload = 4095;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -1299,7 +1344,7 @@ void StartTask02(void *argument)
   /* Init module (Sec 2.7) now owns the one-shot boot sequence: it calls
      Configuration_Init()/Log_Init()/Event_Init(), in that order, then
      reports a startup event to Event - see init.c. */
-  Init_Start(g_rtc_timestamp);
+  Init_Start(g_rtc_timestamp, g_wasWatchdogReset);
 
   /* Mirror Configuration's/Log's/Event's own state into the existing
      debugger-watch globals below - these are all getters on each
@@ -1687,18 +1732,16 @@ void StartTask07(void *argument)
 void StartTask08(void *argument)
 {
   /* USER CODE BEGIN StartTask08 */
-  /* IWDG is windowed (Prescaler=4, Reload=4095, Window=999 - NOT changed
-     here, see PROJECT_GUIDE.md): counter clock is LSI(~32kHz)/4 = 8kHz,
-     so the full timeout is ~512ms, and a refresh is only ACCEPTED between
-     ~387ms and ~512ms after the previous one (too early resets it just
-     like too late). 450ms is the midpoint of that window, giving roughly
-     +-62ms of margin either side. Delay first, then refresh: the very
-     first refresh must also land inside the window measured from boot,
-     not happen immediately at task start. */
+  /* IWDG is not windowed (Prescaler=32, Reload=Window=4095): counter
+     clock is LSI(~32kHz)/32 = 1kHz, so the full timeout is ~4.1s and a
+     refresh is accepted at any time before it elapses. Refreshing every
+     1.5s leaves wide margin on both sides. WatchdogTask runs at the
+     highest priority so a starved/stuck lower-priority task cannot
+     prevent this refresh from running. */
   for(;;)
   {
-    osDelay(450);
- //   HAL_IWDG_Refresh(&hiwdg);
+    osDelay(1500);
+    HAL_IWDG_Refresh(&hiwdg);
   }
   /* USER CODE END StartTask08 */
 }
