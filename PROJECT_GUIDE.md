@@ -259,7 +259,7 @@ PA2/PA3 are the Nucleo board's default ST-LINK virtual-COM-port pins. The user h
 
 | # | Question | Class |
 |---|---|---|
-| 2 | The LNC currently has **no watchdog at all** — the IWDG peripheral and `WatchdogTask`'s refresh logic were removed entirely (see Sec 14's UART/RX investigation write-up for why), so Sec 2.9's watchdog requirement is now fully unimplemented, not just untuned. A real `WatchdogTask` will need designing from scratch later. | **BLOCKING** for WatchdogTask — a new open item, was previously "tuning," now "doesn't exist" |
+| 2 | ~~The LNC currently has no watchdog at all~~ **RESOLVED (2026-09-08): Watchdog rebuilt from scratch and hardware-verified in normal operation** — non-windowed IWDG (Prescaler=32, Reload=Window=4095, ~4.1s timeout), `WatchdogTask` at highest priority refreshing every 1.5s, `RCC_FLAG_IWDGRST` captured at boot and threaded through `Init_Start()`. See the "Watchdog (Sec 2.9) — COMPLETE" section at the end of this document for full detail, including the deliberate-reset test that was explicitly NOT yet performed. | Was **BLOCKING**, now RESOLVED for normal operation |
 | 3 | Sec 2.3.1's "suppresses non-essential operations" / "resumes full operation" during Error mode — spec never defines which operations are non-essential. | **IMPORTANT**, needed at Event/Application-layer design time |
 | 6 | Default configuration limit values (temperature/humidity/light/battery thresholds) — spec doesn't give numbers. | **IMPORTANT**, placeholders needed at Configuration-module design time |
 | 8 | ADC1 (12-bit) vs ADC2 (8-bit) resolution asymmetry — intentional, or an unreviewed CubeMX default? | MINOR |
@@ -275,7 +275,7 @@ PA2/PA3 are the Nucleo board's default ST-LINK virtual-COM-port pins. The user h
 - **Object detection: IR vs. sonar (was #1) — resolved: hardware is a single-pin digital IR sensor, not sonar.** Confirmed directly from code, not guessed: `main.c`'s GPIO init uses `GPIO_MODE_INPUT` (plain digital input, no interrupt) on `IR_Pin`/PB10; `Embeded.ioc` labels the pin `IR` with `Signal=GPIO_Input`; no EXTI handler exists anywhere for PB10; and the full pin table (Sec 9.1) allocates only this one pin to object detection - a real ultrasonic sonar module would need a second pin (Trigger + Echo) plus a timer input-capture channel for pulse-width/distance measurement, and neither exists in this project. The spec's word "sonar" is informal phrasing for "the object-detection sensor," not a literal requirement. User confirmed this conclusion.
 - All RGB LED / button / buzzer / battery / light pin assignments — now labeled in CubeMX.
 - SPI1 4-bit datasize bug — fixed to 8-bit.
-- RTC peripheral — added and working. IWDG — added, then **removed entirely** partway through this project (see Sec 14 and #2 above) after it was found to be the root cause of a real hardware bug; a watchdog no longer exists in the LNC at all right now.
+- RTC peripheral — added and working. IWDG — added, then **removed entirely** partway through this project (see Sec 14 and #2 above) after it was found to be the root cause of a real hardware bug; **rebuilt from scratch and hardware-verified in normal operation as of 2026-09-08** (see the "Watchdog (Sec 2.9) — COMPLETE" section at the end of this document).
 - Ethernet on the LNC — confirmed not needed; simulated on the PC side for CC↔GS only.
 - UART RX method — confirmed: polling with a short timeout + mandatory `osDelay(1)` yield (Sec. 7), not interrupt-driven.
 - Log/Configuration storage split — SD card (FatFs) for Log's daily files, internal MCU flash for Configuration's small limit values (this was an assumption — **not yet explicitly confirmed with the user**, worth a quick check before writing `flash_storage.c`/Log/Configuration).
@@ -2285,3 +2285,169 @@ path, or the Embedded RX side.
 
 **NEXT STEP**: complete the read-only root-cause investigation before making any code changes. Do not
 mark the issue as fixed. No source files were changed as part of this documentation update.
+
+---
+
+## Watchdog (Sec 2.9) — COMPLETE, hardware-verified in normal operation (2026-09-08)
+
+Resolves Open Question #2 (Sec 10). Reopened by explicit user decision after being deliberately removed
+earlier in the project (Sec 14's UART/RX investigation) following a real hardware bug caused by the old
+windowed IWDG config. This time built from scratch with a simple, non-windowed configuration and verified
+before being trusted again.
+
+### CubeMX configuration
+- IWDG activated. **Prescaler = 32, Reload = 4095, Window = 4095** (non-windowed - Window equals Reload,
+  so the window-check is effectively disabled, unlike the old config that caused the earlier bug).
+- Counter clock: LSI (~32 kHz) / 32 ≈ 1 kHz. Full timeout ≈ 4095 / 1 kHz ≈ **4.1 seconds**.
+- Regeneration verified directly in source before implementation: `HAL_IWDG_MODULE_ENABLED` defined,
+  `hiwdg` handle, `MX_IWDG_Init()` declared/called/defined, all three init values confirmed matching in
+  `main.c`. The three regeneration-sensitive items from Open Question #16 (task stack sizes,
+  `configCHECK_FOR_STACK_OVERFLOW`, TIM3 prescaler) were re-checked and found intact - this regeneration
+  did not silently revert anything from that list.
+
+### What was implemented
+- **`WatchdogTask` (`StartTask08`, `main.c`)**: raised to `osPriorityRealtime` - the highest CMSIS-RTOS2
+  priority tier below the ISR-reserved level, above every other task (all of which remain at
+  `osPriorityLow`) - matching Sec 7's design table ("WatchdogTask | periodic | 4 (highest)"). Loop body is
+  exactly `osDelay(1500); HAL_IWDG_Refresh(&hiwdg);` - refreshing every 1.5s inside the ~4.1s timeout,
+  with wide margin on both sides (no windowing to violate this time).
+- **Reset-cause capture (`main.c`)**: `RCC_FLAG_IWDGRST` read via `__HAL_RCC_GET_FLAG()` immediately after
+  `HAL_Init()` (the earliest point that reliably captures it, since RCC->CSR's reset flags persist across
+  `HAL_Init()`), stored in a new global `uint8_t g_wasWatchdogReset`, then `__HAL_RCC_CLEAR_RESET_FLAGS()`
+  clears them immediately afterward so the next boot starts clean.
+- **`Init_Start()` signature change (`init.h`/`init.c`)**: now `Init_Start(uint32_t timestamp, uint8_t
+  wasWatchdogReset)`. `init.c`'s `startup.flag` now receives the real passed-in value instead of the old
+  hardcoded `0`. `init.c` still contains **no watchdog logic itself** - it only receives the
+  already-determined flag as a plain parameter, the same convention as `timestamp`; reading
+  `RCC_FLAG_IWDGRST` remains exclusively `main()`'s responsibility. `main.c`'s call site updated to
+  `Init_Start(g_rtc_timestamp, g_wasWatchdogReset)`.
+- **Files changed**: `Embeded/Core/Src/main.c`, `Embeded/Core/Inc/init.h`, `Embeded/Core/Src/init.c`, plus
+  the CubeMX-regenerated `.ioc`/`.mxproject`/`stm32l4xx_hal_conf.h` and the newly-added
+  `stm32l4xx_hal_iwdg.c/.h`/`stm32l4xx_ll_iwdg.h` HAL driver files. No other source file touched (no
+  changes to CentralComputer, GroundStation, FleetOOP, Communication, Monitor, KeepAlive, TxQueue).
+- Implemented incrementally per this project's standard process: `main.c` alone first (build-verified),
+  then `init.h`/`init.c` together with the `main.c` call-site update (build-verified again), each step
+  reviewed and approved before the next.
+
+### Build verification
+- `main.c` and `init.c` both compiled with **0 errors, 0 warnings**.
+- Full link verified successful (`text=80004, data=156, bss=28068`, up from the prior baseline of
+  `text=79680, data=156, bss=24020` as expected for the new IWDG/task-stack additions). The local
+  `Embeded/Debug/` build-cache directory (gitignored, not part of the tracked project) initially lacked
+  `stm32l4xx_hal_iwdg.c` in its generated file list since it predated this CubeMX regeneration; this is a
+  stale-local-cache artifact only, not a source defect, and resolves itself on the next STM32CubeIDE build.
+
+### HeartbeatTask / FreeRTOS heap exhaustion (found and fixed during verification)
+While investigating the diagnostic `HeartbeatTask` (an unrelated, pre-existing round-5 diagnostic added
+during an earlier Object Detection freeze investigation, not part of the Watchdog design) showing
+`g_heartbeat_count` stuck at 0, root-caused to **FreeRTOS heap exhaustion**: `HeartbeatTask` is the last
+of 9 `osThreadNew()` calls in `main.c`, and `configTOTAL_HEAP_SIZE` (`19392` bytes) was not enough to
+cover all 9 tasks' dynamically-allocated stacks + TCBs once `WatchdogTask` was added - `osThreadNew()`
+silently returns `NULL` on allocation failure (no error is logged anywhere), so `HeartbeatTaskHandle` was
+NULL and `StartHeartbeatTask()` was simply never entered. **Fixed by raising `configTOTAL_HEAP_SIZE` to
+`24576`** in `FreeRTOSConfig.h`, which gives ample headroom (~5.6 KB free vs. the ~1 KB actually needed
+for all 9 tasks' TCBs). Confirmed: `HeartbeatTask` is now created and running correctly. **This
+`configTOTAL_HEAP_SIZE = 24576` value is now part of the current, working project state** - do not revert
+it to the old `19392` without re-checking this margin. Not a Watchdog-specific issue, but found and fixed
+in the course of this work; worth remembering as a general lesson (this project's heap margin runs tight
+by design - see `tx_queue.c`'s deliberate use of static, not heap, allocation for its message queues).
+
+### Hardware verification status - be precise about what was and wasn't tested
+- **PASS, hardware-verified**: normal operation over an extended run - no false/unexpected resets, with
+  `WatchdogTask` at the highest priority and refreshing every 1.5s. User confirmed this directly.
+- **NOT performed, by explicit user decision**: the deliberate forced-hang recovery test (temporarily
+  hanging `WatchdogTask` to force a real IWDG reset), and therefore also **not yet confirmed on real
+  hardware**: `g_wasWatchdogReset == 1` after an actual watchdog-caused reset, and `g_wasWatchdogReset ==
+  0` after a normal NRST/power-cycle reset. The reset-cause-capture code path (`RCC_FLAG_IWDGRST` read/
+  clear, `Init_Start()` plumbing) is implemented and build-verified, but its correctness under an actual
+  watchdog-triggered reset remains unverified. If this matters for the project write-up/demo, run Steps
+  2-4 of the hardware verification procedure before claiming this part is hardware-verified.
+- Committed as `bf7d392` ("Add wasWatchdogReset flag to Init_Start() and main.c, update related
+  comments").
+
+**Watchdog (Sec 2.9) is considered DONE for normal-operation purposes.** Do not reopen or redesign it
+further without a new explicit user decision, per this project's established convention for
+already-verified modules.
+
+---
+
+## Command [5] Root-Cause Investigation — mechanism identified, NOT yet confirmed live (2026-09-08)
+
+Continues Sec 15's items 1-16 investigation (2026-09-06 session) into Command [5]
+(`TAG_SET_TEMP_NORMAL_RANGE = 0x01`) not consistently reaching the Embedded dispatcher.
+**Investigation only, per explicit instruction — no source files were modified anywhere in this project.**
+No instrumentation was added, per explicit instruction.
+
+### Full end-to-end trace performed (read-only)
+- **CC TX path, confirmed by direct code reading**: `cc_main.cpp` (`case '5'`) →
+  `handleSetTempNormalRange()` → `ManagementCommand::setTempNormalRange()` →
+  `message::buildSetTempNormalRange()` → `tlv::encodeFrame()` → `Communication::sendFrame()` →
+  `SerialPort::send()` → a single `WriteFile()` call for the whole frame. No chunking, no
+  length-dependent branching anywhere on the TX side - ruled out again, this time from the actual code,
+  not just repeated assumption.
+- **Exact frame bytes confirmed**: Command 5 = `SOF, 0x01, 0x08,0x00 (len=8 LE), <4-byte float low LE>,
+  <4-byte float high LE>, CRC-lo, CRC-hi` = 14 bytes total. Command 6 = `SOF, 0x10, 0x00,0x00 (len=0),
+  CRC-lo, CRC-hi` = 6 bytes total. Matches the guide's previously-documented byte counts exactly.
+- **`tlv::encodeFrame`/`Decoder` (CC, C++, `Common/TLVCodec/tlv_codec.cpp`) and `Protocol_EncodeFrame`/
+  `Protocol_FeedByte` (LNC, C, `Embeded/Core/Src/protocol.c`) read side by side, in full**: both
+  independently implement the identical `SOF+Tag+LenLo+LenHi+Value+CRClo+CRChi` layout and identical
+  CRC-16/CCITT-FALSE algorithm. No mismatch found. Re-confirms Sec 15 item 9: the decoder itself has no
+  size limit or bug specific to an 8-byte value/14-byte frame - it is fully length-agnostic.
+- **LNC RX path**: `CommRxTask` (`StartTask05`, `main.c:1578-1639`) calls `Transport_UART_ReceiveByte()`
+  once per loop iteration (one byte, 20ms timeout), feeds the byte to `Protocol_FeedByte()`, and calls
+  `osDelay(1)` only when no byte arrived within the timeout - confirmed matching Sec 7's locked design.
+
+### New finding: a concrete, previously-undocumented UART overrun mechanism
+Sec 15 item 10 already floated "UART overrun" as a **plausible, unproven** hypothesis. This session traced
+it mechanically, all the way into the actual HAL source for this exact STM32L4 HAL version, and found a
+specific, credible failure path:
+
+- `Transport_UART_ReceiveByte()` (`comm_transport_uart.c:39-48`) treats `HAL_TIMEOUT` and `HAL_ERROR`
+  identically - its own comment says "Any non-OK result (timeout or error) just means 'no byte right
+  now'" - and never inspects or clears any UART error flag itself.
+- USART2 RX is polling-only, one byte per `HAL_UART_Receive()` call, no DMA/interrupt/hardware buffering
+  beyond the single-byte `RDR` register (a deliberate, documented Sec 7 design choice).
+- Traced `HAL_UART_Receive()` (`stm32l4xx_hal_uart.c:1247`) into `UART_WaitOnFlagUntilTimeout()`
+  (`stm32l4xx_hal_uart.c:3548`): the Overrun-Error (`ORE`) flag is only checked-and-cleared **inside the
+  active-wait loop, and only while `RXNE` is still RESET at the moment it's checked**. If `CommRxTask` is
+  ever delayed (FreeRTOS scheduling, other tasks, its own `osDelay(1)` idle cycle) long enough that a
+  *second* byte arrives on the wire while a *first* byte is still sitting unread in `RDR`, the hardware
+  sets `ORE` and discards the new byte. When `CommRxTask`'s next `HAL_UART_Receive()` call starts,
+  `RXNE` is already SET (from the retained first byte), so the wait loop's body - which contains the only
+  code that checks/clears `ORE` - never executes at all: the call returns `HAL_OK` immediately with
+  whatever byte is in `RDR`, and `ORE` is left set, uninspected, by this code path.
+- **Net effect**: whenever `CommRxTask` falls behind by even one byte-time (~87µs at 115200 baud) with 2+
+  bytes queued, every byte after the first is silently and permanently lost. The decoder never sees them
+  and (per Sec 15 item 11's own prior analysis) is left waiting indefinitely for value/CRC bytes that
+  already went by - producing exactly the documented symptom: `g_frames_decoded_ok` and
+  `g_frames_decode_error` both stay unchanged.
+- **This directly explains the strongest previously-unexplained fact in the whole investigation: why frame
+  length correlates with failure.** Command 5 needs 14 consecutive successful single-byte reads to fully
+  decode; Command 6 needs only 6. Every additional byte is one more independent opportunity for this
+  timing race to hit, so Command 5 is far more exposed to the same underlying hazard than Command 6 -
+  consistent with Command 6 reliably working, Command 5 failing "consistently" in recent testing, yet also
+  having worked "at least once" historically (Sec 15 item 12): a timing race is probabilistic, not
+  deterministic.
+- Does not contradict anything already ruled out (frame-size cap, CRC algorithm mismatch, float encoding,
+  CC TX path) - this sits entirely on the LNC RX side, inside the exact mechanism Sec 15 items 10-11 had
+  already flagged as the leading suspect but had not mechanically traced before now.
+
+### Status: mechanism identified from source — NOT YET CONFIRMED live on hardware
+This is a confirmed **code-level** mechanism (traced through the actual HAL source, not inferred or
+guessed), but it remains a **hypothesis for what actually happens on the real board** during a real
+Command 5 failure until confirmed with a live capture. Do not mark Command [5] as root-caused/fixed based
+on this alone.
+
+### Exact next investigation needed (requires approval before any change)
+The single most direct confirmation: read `huart2.ErrorCode` (already a field of the existing
+`UART_HandleTypeDef huart2` in `main.c` - no new global required) immediately after reproducing a Command
+5 failure. If it reads `HAL_UART_ERROR_ORE` (or has been nonzero at any point), that is direct, hard proof
+this mechanism is firing. Two options, in order of preference:
+1. **No code change**: add `huart2.ErrorCode` as a debugger Live Expression/Watch and inspect it right
+   after reproducing a failed Command 5. This requires no source changes at all.
+2. **One-line, read-only debug mirror** (only with explicit approval, per instruction not to add
+   instrumentation otherwise): a `g_uart_error_code` global copied from `huart2.ErrorCode` after each RX
+   call, matching the existing pattern already used for `g_dispatch_last_tag` etc. - useful if the error
+   needs to be caught mid-run rather than only at a breakpoint.
+
+**No source files were modified as part of this investigation - documentation only.**

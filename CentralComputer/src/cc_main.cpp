@@ -114,6 +114,7 @@ void printMenu()
     std::printf("[4] Show a report (last 7 days)\n");
     std::printf("[5] Send test command: set temperature Normal range (HW-B-C-02)\n");
     std::printf("[6] Request the LNC's system time (HW-B-C-03)\n");
+    std::printf("[7] Configure sensor limits\n");
     std::printf("[q] Quit\n");
     std::printf("> ");
     std::fflush(stdout);
@@ -196,8 +197,8 @@ void handleRequestBackfill(data_collection::DataCollection &collection)
    Configuration's default (15.0/30.0) so the change is unambiguous. */
 void handleSetTempNormalRange(management_command::ManagementCommand &mgmt)
 {
-    constexpr float kTestLow = 18.0f;
-    constexpr float kTestHigh = 28.0f;
+    constexpr float kTestLow = 20.0f;
+    constexpr float kTestHigh = 30.0f;
     bool sent = mgmt.setTempNormalRange(kTestLow, kTestHigh);
     std::printf("\n[cmd] setTempNormalRange(%.1f, %.1f) -> sendFrame result: %s\n", kTestLow, kTestHigh,
                 sent ? "ok" : "FAILED (is the port open?)");
@@ -216,6 +217,81 @@ void handleRequestSystemTime(management_command::ManagementCommand &mgmt)
     std::printf("\n[cmd] requestSystemTime() -> sendFrame result: %s\n", sent ? "ok" : "FAILED (is the port open?)");
     std::printf("      Check the STM32 debugger's g_dispatch_system_time_request_count (should increase by 1).\n");
     std::printf("      Waiting for the reply - it prints automatically when it arrives.\n");
+}
+
+/* [7]: the real, repeatable sensor-limit configuration CLI - as opposed
+   to [5]'s hardcoded HW-B-C-02 test probe. Lets the operator pick any of
+   the 8 already-implemented "set limit" commands, enter its value(s),
+   and send it - repeatable as many times as needed in one run. */
+void handleSetSensorLimit(management_command::ManagementCommand &mgmt)
+{
+    std::printf("\nSelect sensor:\n");
+    std::printf("1. Temperature\n");
+    std::printf("2. Humidity\n");
+    std::printf("3. Light\n");
+    std::printf("4. Battery\n");
+    std::printf("> ");
+    std::fflush(stdout);
+    int sensor = _getch();
+    std::printf("%c\n", sensor);
+
+    if (sensor < '1' || sensor > '4')
+    {
+        std::printf("Invalid sensor selection.\n");
+        return;
+    }
+
+    std::printf("Select mode:\n");
+    std::printf("1. Normal\n");
+    std::printf("2. Warning\n");
+    std::printf("> ");
+    std::fflush(stdout);
+    int mode = _getch();
+    std::printf("%c\n", mode);
+
+    if (mode != '1' && mode != '2')
+    {
+        std::printf("Invalid mode selection.\n");
+        return;
+    }
+
+    bool isNormal = (mode == '1');
+    bool sent = false;
+
+    if (sensor == '1')
+    {
+        float low = 0.0f;
+        float high = 0.0f;
+        std::printf("Enter lower limit: ");
+        std::fflush(stdout);
+        std::scanf("%f", &low);
+        std::printf("Enter upper limit: ");
+        std::fflush(stdout);
+        std::scanf("%f", &high);
+        sent = isNormal ? mgmt.setTempNormalRange(low, high) : mgmt.setTempWarningRange(low, high);
+    }
+    else
+    {
+        float value = 0.0f;
+        std::printf("Enter lower limit: ");
+        std::fflush(stdout);
+        std::scanf("%f", &value);
+
+        if (sensor == '2')
+        {
+            sent = isNormal ? mgmt.setHumidityNormalLower(value) : mgmt.setHumidityWarningLower(value);
+        }
+        else if (sensor == '3')
+        {
+            sent = isNormal ? mgmt.setLightNormalLower(value) : mgmt.setLightWarningLower(value);
+        }
+        else /* '4' */
+        {
+            sent = isNormal ? mgmt.setBatteryNormalLower(value) : mgmt.setBatteryWarningLower(value);
+        }
+    }
+
+    std::printf("\n[cmd] sendFrame result: %s\n", sent ? "ok" : "FAILED (is the port open?)");
 }
 
 }  // namespace
@@ -295,6 +371,9 @@ int main()
                     break;
                 case '6':
                     handleRequestSystemTime(cc.managementCommand());
+                    break;
+                case '7':
+                    handleSetSensorLimit(cc.managementCommand());
                     break;
                 case 'q':
                 case 'Q':
