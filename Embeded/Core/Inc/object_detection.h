@@ -60,7 +60,7 @@ extern "C" {
  * Starting values agreed with the user - tune after the real-hardware
  * test if needed, nothing else in this file depends on the exact
  * numbers. */
-#define IR_POLL_INTERVAL_MS    20
+#define IR_POLL_INTERVAL_MS    5
 #define IR_ACTIVITY_TIMEOUT_MS 400
 
 /* Resets internal state to "no object" (a safe starting assumption,

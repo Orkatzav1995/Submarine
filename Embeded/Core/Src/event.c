@@ -212,10 +212,11 @@ uint16_t Event_OnObjectDetection(const TimestampWithFlagMessage *detection, uint
 {
     const char *description;
 
-    if (detection->flag)
+    if (!detection->flag)
     {
         Led_SetColor(LED_COLOR_RED);
-        Buzzer_On();
+        //Buzzer_On();
+        Buzzer_Off();
         s_alarmActive = 1;
         description = "OBJECT DETECTED";
     }
@@ -224,7 +225,8 @@ uint16_t Event_OnObjectDetection(const TimestampWithFlagMessage *detection, uint
         Led_SetColor(LED_COLOR_GREEN);
         if (s_alarmActive)
         {
-            Buzzer_Off();
+           // Buzzer_Off();
+            Buzzer_On();
             s_alarmActive = 0;
         }
         description = "OBJECT CLEARED";

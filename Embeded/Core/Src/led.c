@@ -36,4 +36,8 @@ void Led_SetColor(LedColor color)
     HAL_GPIO_WritePin(RGB_LED_3_GPIO_Port, RGB_LED_3_Pin, red);
     HAL_GPIO_WritePin(RGB_LED_1_GPIO_Port, RGB_LED_1_Pin, green);
     HAL_GPIO_WritePin(RGB_LED_2_GPIO_Port, RGB_LED_2_Pin, blue);
+
+
+
+
 }
